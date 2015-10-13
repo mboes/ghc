@@ -354,8 +354,10 @@ filterComplex = zipWith rename nameList . map mkGroup
     isNegLitCs' (PmExprLit l) (PmExprVar x) = Just (x, l)
     isNegLitCs' _ _             = Nothing
 
+    -- Try nice names p,q,r,s,t before using the (ugly) t_i
     nameList :: [SDoc]
-    nameList = [ ptext (sLit ('t':show u)) | u <- [(0 :: Int)..] ]
+    nameList = map (ptext . sLit) ["p","q","r","s","t"] ++
+                 [ ptext (sLit ('t':show u)) | u <- [(0 :: Int)..] ]
 
 -- ----------------------------------------------------------------------------
 
