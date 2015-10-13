@@ -47,6 +47,7 @@ import Type
 import UniqSupply
 import DsGRHSs    -- isTrueLHsExpr
 
+-- || import qualified Data.Map as Map -- let's check performance
 import Data.List     -- find
 import Data.Maybe    -- isNothing, isJust, fromJust
 import Control.Monad -- liftM3, forM
@@ -731,6 +732,10 @@ splitConstraints (c : rest)
 %*                                                                      *
 %************************************************************************
 -}
+
+-- || -- let's check performance
+-- || satisfiable :: [PmConstraint] -> PmM (Maybe ([ComplexEq], PmVarEnv))
+-- || satisfiable _ = return $ Just ([], Map.empty)
 
 -- Same interface to check all kinds of different constraints like in the paper
 satisfiable :: [PmConstraint] -> PmM (Maybe ([ComplexEq], PmVarEnv)) -- Bool -- Give back the substitution for pretty-printing
