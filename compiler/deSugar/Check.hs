@@ -137,7 +137,7 @@ checkSingle var p = do
   vec <- liftUs (translatePat p)
   vsa <- initial_uncovered [var]
   (c,d,us') <- patVectProc (vec,[]) vsa -- no guards
-  us <- pruneValSetAbs us'
+  us <- pruneValSetAbsNew us'
   return $ case (c,d) of
     (True,  _)     -> ([],   [],   us)
     (False, True)  -> ([],   [lp], us)
@@ -153,7 +153,7 @@ checkMatches vars matches
       return (map hsLMatchPats rs, map hsLMatchPats is, us)
   where
     go [] missing = do
-      missing' <- pruneValSetAbs missing
+      missing' <- pruneValSetAbsNew missing
       return ([], [], missing')
 
     go (m:ms) missing = do
@@ -776,6 +776,95 @@ pruneValSetAbs = mapMaybeM sat . valSetAbsToList
   where
     sat (vec, cs) = ((\vsa -> (vec,vsa))<$>) <$> satisfiable cs
 
+-- | Trying something more incremental
+-- ----------------------------------------------------------------------------
+
+anySatValSetAbsNew :: ValSetAbs -> PmM Bool
+anySatValSetAbsNew vsa = isNotEmpty <$> pruneValSetAbsBound 1 vsa
+
+pruneValSetAbsNew :: ValSetAbs -> PmM [(ValVecAbs,([ComplexEq], PmVarEnv))]
+pruneValSetAbsNew = pruneValSetAbsBoundVec 4
+
+pruneValSetAbsBound :: Int -> ValSetAbs -> PmM ValSetAbs
+pruneValSetAbsBound n v = fst <$> pruneValSetAbsBound' n init_cs v
+  where
+    init_cs :: ([EvVar], IncrState, Maybe Id)
+    init_cs = ([], initialIncrState, Nothing)
+
+    pruneValSetAbsBound' :: Int -> ([EvVar], IncrState, Maybe Id) -> ValSetAbs -> PmM (ValSetAbs, Int) -- how many left. @$#%$ Union!
+    pruneValSetAbsBound' n all_cs@(ty_cs, tm_env, bot_ct) in_vsa
+      | n <= 0    = return (Empty, 0) -- no need to keep going
+      | otherwise = case in_vsa of
+          Empty -> return (Empty, n)
+          Union vsa1 vsa2 -> do
+            (vsa1', m) <- pruneValSetAbsBound' n all_cs vsa1
+            (vsa2', k) <- pruneValSetAbsBound' m all_cs vsa2
+            return (mkUnion vsa1' vsa2', k)
+          Singleton -> do -- return (Singleton, n-1)
+            sat <- tyOracle (listToBag ty_cs) -- it would be nice to have this incremental too
+            return $ case sat of
+              True  -> (Singleton, n-1)
+              False -> (Empty, n)
+          Constraint cs vsa -> case splitConstraints cs of -- undefined {- FIXME -}
+            (new_ty_cs, new_tm_cs, new_bot_ct) -> case tmOracleIncr tm_env new_tm_cs of
+              Just (new_tm_env@(residual, (expr_eqs, subst))) ->
+                let bot = mergeBotCs new_bot_ct bot_ct
+                    ans = isNothing bot || notNull residual || notNull expr_eqs || notForced (fromJust bot) subst
+                in  case ans of
+                      True  -> pruneValSetAbsBound' n (new_ty_cs++ty_cs, new_tm_env, bot) vsa
+                      False -> return (Empty, n)
+              Nothing -> return (Empty, n)
+          Cons va vsa -> do
+            (vsa', m) <- pruneValSetAbsBound' n all_cs in_vsa
+            return (mkCons va vsa', m)
+
+mergeBotCs :: Maybe Id -> Maybe Id -> Maybe Id
+mergeBotCs (Just x) Nothing  = Just x
+mergeBotCs Nothing  (Just y) = Just y
+mergeBotCs Nothing  Nothing  = Nothing
+mergeBotCs (Just _) (Just _) = panic "mergeBotCs: two (x ~ _|_) constraints"
+
+wrapUpIncrState :: IncrState -> ([ComplexEq], PmVarEnv)
+wrapUpIncrState (residual, (_unhandled, subst)) = (residual, flattenPmVarEnv subst)
+
+pruneValSetAbsBoundVec :: Int -> ValSetAbs -> PmM [(ValVecAbs,([ComplexEq], PmVarEnv))]
+pruneValSetAbsBoundVec n v = fst <$> pruneValSetAbsBoundVec' n init_cs emptylist v
+  where
+    init_cs :: ([EvVar], IncrState, Maybe Id)
+    init_cs = ([], initialIncrState, Nothing)
+
+    pruneValSetAbsBoundVec' :: Int -> ([EvVar], IncrState, Maybe Id) -> DList ValAbs -> ValSetAbs -> PmM ([(ValVecAbs,([ComplexEq], PmVarEnv))], Int)
+    pruneValSetAbsBoundVec' n all_cs@(ty_cs, tm_env, bot_ct) vec in_vsa
+      | n <= 0    = return ([], 0) -- no need to keep going
+      | otherwise = case in_vsa of
+          Empty -> return ([], n)
+          Union vsa1 vsa2 -> do
+            (vecs1, m) <- pruneValSetAbsBoundVec' n all_cs vec vsa1
+            (vecs2, k) <- pruneValSetAbsBoundVec' m all_cs vec vsa2
+            return (vecs1 ++ vecs2, k)
+          Singleton -> do -- return (Singleton, n-1)
+            sat <- tyOracle (listToBag ty_cs) -- it would be nice to have this incremental too
+            return $ case sat of
+              True  -> ([(toList vec, wrapUpIncrState tm_env)], n-1)
+              False -> ([], n)
+          Constraint cs vsa -> case splitConstraints cs of -- undefined {- FIXME -}
+            (new_ty_cs, new_tm_cs, new_bot_ct) -> case tmOracleIncr tm_env new_tm_cs of
+              Just (new_tm_env@(residual, (expr_eqs, subst))) ->
+                let bot = mergeBotCs new_bot_ct bot_ct
+                    ans = isNothing bot || notNull residual || notNull expr_eqs || notForced (fromJust bot) subst
+                in  case ans of
+                      True  -> pruneValSetAbsBoundVec' n (new_ty_cs++ty_cs, new_tm_env, bot) vec vsa
+                      False -> return ([], n)
+              Nothing -> return ([], n)
+          Cons va vsa -> pruneValSetAbsBoundVec' n all_cs (vec `snoc` va) in_vsa
+
+isNotEmpty :: ValSetAbs -> Bool
+isNotEmpty Empty = False
+isNotEmpty _vsa  = True
+
+-- ----------------------------------------------------------------------------
+-- ----------------------------------------------------------------------------
+
 -- It checks whether a set of type constraints is satisfiable.
 tyOracle :: Bag EvVar -> PmM Bool
 tyOracle evs
@@ -851,8 +940,8 @@ patVectProc (vec,gvs) vsa = do
   us <- getUniqueSupplyM
   let (c_def, u_def, d_def) = process_guards us gvs -- default (the continuation)
   (usC, usU, usD) <- getUniqueSupplyM3
-  mb_c <- anySatValSetAbs (covered   usC c_def vec vsa)
-  mb_d <- anySatValSetAbs (divergent usD d_def vec vsa)
+  mb_c <- anySatValSetAbsNew (covered   usC c_def vec vsa)
+  mb_d <- anySatValSetAbsNew (divergent usD d_def vec vsa)
   let vsa' = uncovered usU u_def vec vsa
   return (mb_c, mb_d, vsa')
 

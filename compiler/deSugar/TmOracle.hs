@@ -5,16 +5,16 @@
 
 {-# OPTIONS_GHC -Wwarn #-}   -- unused variables
 
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE CPP, MultiWayIf #-}
 
 module TmOracle (
           PmExpr(..), PmLit(..), PmVarEnv, SimpleEq, ComplexEq, PmNegLitCt,
           hsExprToPmExpr, lhsExprToPmExpr, isNotPmExprOther,
           pmLitType, eqPmLit, tmOracle, notForced, flattenPmVarEnv,
           falsePmExpr, getValuePmExpr, filterComplex, runPmPprM,
-          pprPmExprWithParens
-          -- -- Incremental version
-          -- solveSimplesIncr, initialIncrState
+          pprPmExprWithParens,
+
+          IncrState, tmOracleIncr, initialIncrState
     ) where
 
 #include "HsVersions.h"
@@ -28,6 +28,7 @@ import HsLit   -- overLitType
 import TcHsSyn -- hsLitType
 import Outputable
 import MonadUtils
+import Util
 
 import Control.Arrow (first)
 import Data.List (foldl')
@@ -331,25 +332,137 @@ flattenPmVarEnv :: PmVarEnv -> PmVarEnv
 flattenPmVarEnv env = Map.map (getValuePmExpr env) env
 
 -- ----------------------------------------------------------------------------
---
--- initialIncrState :: ([ComplexEq], TmOracleEnv)
--- initialIncrState = ([], ([], Map.empty))
---
--- solveSimplesIncr :: ([ComplexEq], TmOracleEnv) -- residual & previous state
---                  -> [SimpleEq]                 -- what to solve
---                  -> Either Failure ([ComplexEq], TmOracleEnv)
--- solveSimplesIncr (residual, (unhandled, mapping)) simples
---   =  runExcept (runStateT result (unhandled, mapping))
---   where
---     complex = map (applySubstSimpleEq mapping) simples ++ residual
---     result  = prepComplexEqM complex >>= iterateComplex
---
--- applySubstSimpleEq :: PmVarEnv -> SimpleEq -> ComplexEq
--- applySubstSimpleEq env (x,e2)
---   = case Map.lookup x env of
---       Just e1 -> (e1,          getValuePmExpr env e2)
---       Nothing -> (PmExprVar x, getValuePmExpr env e2)
---
+
+type IncrState = ( [ComplexEq]   -- constraints that cannot be solved yet (we need more info)
+                 , TmOracleEnv ) -- ([ComplexEq], PmVarEnv == Map Id PmExpr)
+                                 --   1. A set of constraints that cannot be handled (PmExprOther stuff).
+                                 --   2. A substitution we extend with every step
+
+initialIncrState :: IncrState
+initialIncrState = ([], ([], Map.empty))
+
+solveSimpleEqIncr :: IncrState -> SimpleEq -> Maybe IncrState
+solveSimpleEqIncr solver_env@(_,(_,env)) simple
+  = solveComplexEqIncr solver_env -- do the actual *merging* with existing solver state
+  $ simplifyComplexEqNew          -- simplify as much as you can
+  $ applySubstSimpleEq env simple -- replace everything we already know
+
+solveComplexEqIncr :: IncrState -> ComplexEq -> Maybe IncrState
+solveComplexEqIncr solver_state@(standby, (unhandled, env)) eq@(e1, e2) = case eq of
+  -- We cannot do a thing about these cases
+  (PmExprOther _,_)            -> Just (standby, (eq:unhandled, env))
+  (_,PmExprOther _)            -> Just (standby, (eq:unhandled, env))
+  -- Look at the catch-all.. (PmExprLit _, PmExprCon _ _) -> Just (standby, (eq:unhandled, env))
+  -- Look at the catch-all.. (PmExprCon _ _, PmExprLit _) -> Just (standby, (eq:unhandled, env))
+  -- Look at the catch-all.. (PmExprLit _, PmExprEq _ _)  -> Just (standby, (eq:unhandled, env))
+  -- Look at the catch-all.. (PmExprEq _ _, PmExprLit _)  -> Just (standby, (eq:unhandled, env))
+
+  (PmExprLit l1, PmExprLit l2)
+    | eqPmLit l1 l2 -> Just solver_state
+    | otherwise     -> Nothing
+  (PmExprCon c1 ts1, PmExprCon c2 ts2)
+    | c1 == c2  -> foldlM solveComplexEqIncr solver_state (zip ts1 ts2)
+    | otherwise -> Nothing
+  (PmExprCon c [], PmExprEq t1 t2)
+    | c == trueDataCon  -> solveComplexEqIncr solver_state (t1, t2)
+    | c == falseDataCon -> Just (eq:standby, (unhandled, env))
+  (PmExprEq t1 t2, PmExprCon c [])
+    | c == trueDataCon  -> solveComplexEqIncr solver_state (t1, t2)
+    | c == falseDataCon -> Just (eq:standby, (unhandled, env))
+
+  (PmExprVar x, PmExprVar y)
+    | x == y    -> Just solver_state
+    | otherwise -> extendSubstAndSolve x e2 solver_state {- CHOOSE ONE AND EXTEND SUBST & LOOK AT STB -}
+
+  (PmExprVar x, PmExprCon {}) -> extendSubstAndSolve x e2 solver_state {- EXTEND SUBST & LOOK AT STB -}
+  (PmExprCon {}, PmExprVar x) -> extendSubstAndSolve x e1 solver_state {- EXTEND SUBST & LOOK AT STB -}
+  (PmExprVar x, PmExprLit {}) -> extendSubstAndSolve x e2 solver_state {- EXTEND SUBST & LOOK AT STB -}
+  (PmExprLit {}, PmExprVar x) -> extendSubstAndSolve x e1 solver_state {- EXTEND SUBST & LOOK AT STB -}
+  (PmExprVar x,  PmExprEq {}) -> extendSubstAndSolve x e2 solver_state {- EXTEND SUBST & LOOK AT STB -}
+  (PmExprEq  {}, PmExprVar x) -> extendSubstAndSolve x e1 solver_state {- EXTEND SUBST & LOOK AT STB -}
+
+  (PmExprEq _ _, PmExprEq _ _) -> Just (eq:standby, (unhandled, env))
+
+  _ -> Just (standby, (eq:unhandled, env)) -- I HATE CATCH-ALLS
+
+extendSubstAndSolve :: Id -> PmExpr -> IncrState -> Maybe IncrState
+extendSubstAndSolve x e (standby, (unhandled, env))
+  = foldlM solveComplexEqIncr new_incr_state changed
+  where
+    (changed, unchanged) = partitionWith (substComplexEqB x e) standby  -- apply substitution to residual to see if there is any progress. leave the unchanged ones behind
+    new_incr_state       = (unchanged, (unhandled, Map.insert x e env)) -- extend the substitution.
+
+simplifyComplexEqNew :: ComplexEq -> ComplexEq
+simplifyComplexEqNew (e1, e2) = (fst $ simplifyPmExpr e1, fst $ simplifyPmExpr e2)
+
+simplifyPmExpr :: PmExpr -> (PmExpr, Bool) -- may we need more?
+simplifyPmExpr e = case e of
+  PmExprCon c ts -> case mapAndUnzip simplifyPmExpr ts of
+                      (ts', bs) -> (PmExprCon c ts', or bs)
+  PmExprEq t1 t2 -> simplifyEqExpr t1 t2
+  _other_expr    -> (e, False) -- the others are terminals
+
+simplifyEqExpr :: PmExpr -> PmExpr -> (PmExpr, Bool) -- deep equalities
+simplifyEqExpr e1 e2 = case (e1, e2) of
+  -- Varables
+  (PmExprVar x, PmExprVar y)
+    | x == y -> (truePmExpr, True)
+
+  -- Literals
+  (PmExprLit l1@(PmSLit {}), PmExprLit l2@(PmSLit {}))
+    | eqPmLit l1 l2 -> (truePmExpr,  True)
+    | otherwise     -> (falsePmExpr, True)
+  (PmExprLit l1@(PmOLit {}), PmExprLit l2@(PmOLit {}))
+    | eqPmLit l1 l2 -> (truePmExpr,  True)
+    | otherwise     -> (falsePmExpr, True)
+
+  -- simplify bottom-up
+  (PmExprEq {}, _) -> case (simplifyPmExpr e1, simplifyPmExpr e2) of
+    ((e1', True ), (e2', _    )) -> simplifyEqExpr e1' e2'
+    ((e1', _    ), (e2', True )) -> simplifyEqExpr e1' e2'
+    ((e1', False), (e2', False)) -> (PmExprEq e1' e2', False) -- cannot go further
+
+  -- Constructors
+  (PmExprCon c1 ts1, PmExprCon c2 ts2) -- constructors
+    | c1 == c2 ->
+        let (ts1', bs1) = mapAndUnzip simplifyPmExpr ts1 -- simplify them separately first
+            (ts2', bs2) = mapAndUnzip simplifyPmExpr ts2 -- simplify them separately first
+            (tss, _bss) = zipWithAndUnzip simplifyEqExpr ts1' ts2'
+            worst_case  = PmExprEq (PmExprCon c1 ts1') (PmExprCon c2 ts2')
+        in  if | not (or bs1 || or bs2) -> (worst_case, False) -- "no progress" (first for efficiency)
+               | all isTruePmExpr  tss  -> (truePmExpr, True)
+               | any isFalsePmExpr tss  -> (falsePmExpr, True)
+               | otherwise              -> (worst_case, False)
+    | otherwise -> (falsePmExpr, True)
+
+  -- We cannot do anything about the rest..
+  _other_equality -> (original, False)
+
+  where
+    original = PmExprEq e1 e2 -- reconstruct equality
+
+
+-- | Look up stuff in an (un-flattened) substitution (same as getValuePmExpr)
+-- ----------------------------------------------------------------------------
+applySubstSimpleEq :: PmVarEnv -> SimpleEq -> ComplexEq
+applySubstSimpleEq env (x, e) = (varDeepLookup env x, exprDeepLookup env e)
+
+varDeepLookup :: PmVarEnv -> Id -> PmExpr
+varDeepLookup env x
+  | Just e <- Map.lookup x env = exprDeepLookup env e -- go deeper
+  | otherwise                  = PmExprVar x          -- terminal
+
+exprDeepLookup :: PmVarEnv -> PmExpr -> PmExpr
+exprDeepLookup env (PmExprVar x)    = varDeepLookup env x
+exprDeepLookup env (PmExprCon c es) = PmExprCon c (map (exprDeepLookup env) es)
+exprDeepLookup env (PmExprEq e1 e2) = PmExprEq (exprDeepLookup env e1) (exprDeepLookup env e2)
+exprDeepLookup _   other_expr       = other_expr -- lit ==> lit, expr_other ==> expr_other
+
+-- | External interface to the solver
+-- ----------------------------------------------------------------------------
+tmOracleIncr :: IncrState -> [SimpleEq] -> Maybe IncrState
+tmOracleIncr env eqs = foldlM solveSimpleEqIncr env eqs
+
 -- ----------------------------------------------------------------------------
 
 -- Should be in PmExpr gives cyclic imports :(

@@ -21,6 +21,9 @@ module PmExpr (
         substSimpleEqs, substComplexEq,
         idSubstVarEq, idSubstSimpleEq, idSubstComplexEq,
 
+        -- Substitution with confirmation
+        substPmExprB, substComplexEqB,
+
         -- Lift (HsExpr Id) to PmExpr
         hsExprToPmExpr, lhsExprToPmExpr,
 
@@ -203,6 +206,31 @@ substPmExpr x e1 e =
     PmExprEq ex ey -> PmExprEq (substPmExpr x e1 ex) (substPmExpr x e1 ey)
     _other_expr    -> e -- The rest are terminals -- we silently ignore
                         -- PmExprOther. See NOTE [PmExprOther in PmExpr]
+
+-- ----------------------------------------------------------------------------
+-- ----------------------------------------------------------------------------
+substPmExprB :: Id -> PmExpr -> PmExpr -> (PmExpr, Bool) -- did anything happen or was it for nothing?
+substPmExprB x e1 e =
+  case e of
+    PmExprVar z | x == z    -> (e1, True)
+                | otherwise -> (e, False)
+    PmExprCon c ps -> let (ps', bs) = mapAndUnzip (substPmExprB x e1) ps
+                      in  (PmExprCon c ps', or bs)
+    PmExprEq ex ey -> let (ex', bx) = substPmExprB x e1 ex
+                          (ey', by) = substPmExprB x e1 ey
+                      in  (PmExprEq ex' ey', bx || by)
+    _other_expr    -> (e, False) -- The rest are terminals -- we silently ignore
+                                 -- PmExprOther. See NOTE [PmExprOther in PmExpr]
+
+substComplexEqB :: Id -> PmExpr -> ComplexEq -> Either ComplexEq ComplexEq -- Left: something changed, Right: no worries
+substComplexEqB x e (ex, ey)
+  | bx || by  = Left  (ex', ey')
+  | otherwise = Right (ex', ey')
+  where
+    (ex', bx) = substPmExprB x e ex
+    (ey', by) = substPmExprB x e ey
+-- ----------------------------------------------------------------------------
+-- ----------------------------------------------------------------------------
 
 idSubstPmExpr :: (Id -> Id) -> PmExpr -> PmExpr
 idSubstPmExpr fn e =
