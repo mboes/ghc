@@ -374,12 +374,14 @@ solveComplexEqIncr solver_state@(standby, (unhandled, env)) eq@(e1, e2) = case e
     | x == y    -> Just solver_state
     | otherwise -> extendSubstAndSolve x e2 solver_state {- CHOOSE ONE AND EXTEND SUBST & LOOK AT STB -}
 
-  (PmExprVar x, PmExprCon {}) -> extendSubstAndSolve x e2 solver_state {- EXTEND SUBST & LOOK AT STB -}
-  (PmExprCon {}, PmExprVar x) -> extendSubstAndSolve x e1 solver_state {- EXTEND SUBST & LOOK AT STB -}
-  (PmExprVar x, PmExprLit {}) -> extendSubstAndSolve x e2 solver_state {- EXTEND SUBST & LOOK AT STB -}
-  (PmExprLit {}, PmExprVar x) -> extendSubstAndSolve x e1 solver_state {- EXTEND SUBST & LOOK AT STB -}
-  (PmExprVar x,  PmExprEq {}) -> extendSubstAndSolve x e2 solver_state {- EXTEND SUBST & LOOK AT STB -}
-  (PmExprEq  {}, PmExprVar x) -> extendSubstAndSolve x e1 solver_state {- EXTEND SUBST & LOOK AT STB -}
+  (PmExprVar x, _) -> extendSubstAndSolve x e2 solver_state {- EXTEND SUBST & LOOK AT STB -}
+  (_, PmExprVar x) -> extendSubstAndSolve x e1 solver_state {- EXTEND SUBST & LOOK AT STB -}
+  -- (PmExprVar x, PmExprCon {}) -> extendSubstAndSolve x e2 solver_state {- EXTEND SUBST & LOOK AT STB -}
+  -- (PmExprCon {}, PmExprVar x) -> extendSubstAndSolve x e1 solver_state {- EXTEND SUBST & LOOK AT STB -}
+  -- (PmExprVar x, PmExprLit {}) -> extendSubstAndSolve x e2 solver_state {- EXTEND SUBST & LOOK AT STB -}
+  -- (PmExprLit {}, PmExprVar x) -> extendSubstAndSolve x e1 solver_state {- EXTEND SUBST & LOOK AT STB -}
+  -- (PmExprVar x,  PmExprEq {}) -> extendSubstAndSolve x e2 solver_state {- EXTEND SUBST & LOOK AT STB -}
+  -- (PmExprEq  {}, PmExprVar x) -> extendSubstAndSolve x e1 solver_state {- EXTEND SUBST & LOOK AT STB -}
 
   (PmExprEq _ _, PmExprEq _ _) -> Just (eq:standby, (unhandled, env))
 
@@ -418,6 +420,10 @@ simplifyEqExpr e1 e2 = case (e1, e2) of
 
   -- simplify bottom-up
   (PmExprEq {}, _) -> case (simplifyPmExpr e1, simplifyPmExpr e2) of
+    ((e1', True ), (e2', _    )) -> simplifyEqExpr e1' e2'
+    ((e1', _    ), (e2', True )) -> simplifyEqExpr e1' e2'
+    ((e1', False), (e2', False)) -> (PmExprEq e1' e2', False) -- cannot go further
+  (_, PmExprEq {}) -> case (simplifyPmExpr e1, simplifyPmExpr e2) of
     ((e1', True ), (e2', _    )) -> simplifyEqExpr e1' e2'
     ((e1', _    ), (e2', True )) -> simplifyEqExpr e1' e2'
     ((e1', False), (e2', False)) -> (PmExprEq e1' e2', False) -- cannot go further
@@ -462,6 +468,12 @@ exprDeepLookup _   other_expr       = other_expr -- lit ==> lit, expr_other ==> 
 -- ----------------------------------------------------------------------------
 tmOracleIncr :: IncrState -> [SimpleEq] -> Maybe IncrState
 tmOracleIncr env eqs = foldlM solveSimpleEqIncr env eqs
+
+-- -- let's see what this can do
+-- tmOracle :: [SimpleEq] -> Either Failure ([ComplexEq], TmOracleEnv)
+-- tmOracle eqs = case tmOracleIncr initialIncrState eqs of
+--   Nothing -> Left undefined
+--   Just x  -> Right x
 
 -- ----------------------------------------------------------------------------
 

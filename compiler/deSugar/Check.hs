@@ -278,8 +278,12 @@ translatePat pat = case pat of
 
   -- overloaded list
   ListPat lpats elem_ty (Just (pat_ty, to_list))
-    | Just e_ty <- splitListTyConApp_maybe pat_ty ->
-        translatePat (ListPat lpats e_ty Nothing) -- ensure that e_ty and elem_ty are the same?? (check OverlappingInstances)
+    | Just e_ty <- splitListTyConApp_maybe pat_ty, elem_ty `eqType` e_ty ->
+        -- Watch out for horrible hack: See Note [Comparison with OpenTypeKind]
+        -- We have to ensure that the element types are the same. Otherwise, one
+        -- may give an instance IsList [Int] (more specific than the default IsList [a])
+        -- with a different implementation for `toList'
+        translatePat (ListPat lpats e_ty Nothing)
     | otherwise -> do
         (xp, xe) <- mkPmId2FormsSM pat_ty
         ps       <- translatePatVec (map unLoc lpats) -- list as value abstraction
@@ -815,7 +819,7 @@ pruneValSetAbsBound n v = fst <$> pruneValSetAbsBound' n init_cs v
                       False -> return (Empty, n)
               Nothing -> return (Empty, n)
           Cons va vsa -> do
-            (vsa', m) <- pruneValSetAbsBound' n all_cs in_vsa
+            (vsa', m) <- pruneValSetAbsBound' n all_cs vsa
             return (mkCons va vsa', m)
 
 mergeBotCs :: Maybe Id -> Maybe Id -> Maybe Id
@@ -856,7 +860,7 @@ pruneValSetAbsBoundVec n v = fst <$> pruneValSetAbsBoundVec' n init_cs emptylist
                       True  -> pruneValSetAbsBoundVec' n (new_ty_cs++ty_cs, new_tm_env, bot) vec vsa
                       False -> return ([], n)
               Nothing -> return ([], n)
-          Cons va vsa -> pruneValSetAbsBoundVec' n all_cs (vec `snoc` va) in_vsa
+          Cons va vsa -> pruneValSetAbsBoundVec' n all_cs (vec `snoc` va) vsa
 
 isNotEmpty :: ValSetAbs -> Bool
 isNotEmpty Empty = False
