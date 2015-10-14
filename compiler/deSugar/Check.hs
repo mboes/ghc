@@ -237,12 +237,12 @@ oStrToHsLit_mb olit
 
 translatePat :: Pat Id -> UniqSM PatVec
 translatePat pat = case pat of
-  WildPat ty         -> (:[]) <$> mkPatternVarSM ty
+  WildPat ty         -> mkPatternVarsSM [ty]
   VarPat  id         -> return [idPatternVar id]
   ParPat p           -> translatePat (unLoc p)
-  LazyPat p          -> translatePat (unLoc p) -- COMEHERE: We ignore laziness   for now
-  BangPat p          -> translatePat (unLoc p) -- COMEHERE: We ignore strictness for now
-                                               -- This might affect the divergence checks?
+  LazyPat p          -> mkPatternVarsSM [hsPatType pat] -- translatePat (unLoc p) -- COMEHERE: We ignore laziness   for now
+  BangPat p          -> translatePat (unLoc p)                                    -- COMEHERE: We ignore strictness for now
+                                                                                  -- This might affect the divergence checks?
   AsPat lid p -> do
     ps <- translatePat (unLoc p)
     let [e] = map valAbsToPmExpr (coercePatVec ps) -- NOTE [Translating As Patterns]
@@ -414,22 +414,34 @@ translateMatch (L _ (Match lpats _ grhss)) = do
 translateGuards :: [GuardStmt Id] -> UniqSM PatVec
 translateGuards guards = do
   all_guards <- concat <$> mapM translateGuard guards
+  -- return $ all_guards
   return (replace_unhandled all_guards) -- Just some ad-hoc pruning
   where
     replace_unhandled :: PatVec -> PatVec
     replace_unhandled gv
-      | any_unhandled gv = fake_pat : [ p | p@(PmGuard pv e) <- gv, unhandled pv e ]
+      | any_unhandled gv = fake_pat : [ p | p <- gv, shouldKeep p ]
       | otherwise        = gv
 
     any_unhandled :: PatVec -> Bool
-    any_unhandled gv = or [ not (unhandled pv e) | PmGuard pv e <- gv ]
+    any_unhandled gv = or [ not (shouldKeep p) | p <- gv ]
 
-    unhandled :: PatVec -> PmExpr -> Bool
-    unhandled pv expr
-      | [p] <- pv
-      , NonGuard (PmVar {}) <- p = True  -- Binds to variable? We don't branch (Y)
-      | isNotPmExprOther expr    = True  -- The expression is "normal"? We branch but we want that
-      | otherwise                = False -- Otherwise it branches without being useful
+    -- unhandled :: PatVec -> PmExpr -> Bool
+    -- unhandled [p] expr
+    --   | NonGuard (PmVar {}) <- p = True  -- Binds to variable? We don't branch (Y)
+    -- unhandled _pv expr
+    --   | isNotPmExprOther expr    = True  -- The expression is "normal"? We branch but we want that
+    --   | otherwise                = False -- Otherwise it branches without being useful
+
+    shouldKeep :: Pattern -> Bool
+    shouldKeep (NonGuard p)
+      | PmVar {} <- p      = True
+      | PmCon {} <- p      = length (allConstructors (pm_con_con p)) == 1
+                             && all shouldKeep (pm_con_args p)
+    shouldKeep (PmGuard pv e)
+      | all shouldKeep pv  = True
+      | isNotPmExprOther e = True -- expensive but we want it
+    shouldKeep _other_pat  = False -- let the rest..
+    -- OPTIMIZE THIS
 
 translateGuard :: GuardStmt Id -> UniqSM PatVec
 translateGuard (BodyStmt e _ _ _) = translateBoolGuard e
