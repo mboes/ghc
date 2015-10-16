@@ -7,36 +7,14 @@
 {-# LANGUAGE CPP #-}
 
 module PmExpr (
-        -- Types
-        PmExpr(..), PmLit(..), PmNegLitCt,
-        VarEq, SimpleEq, ComplexEq,
-
-        -- Partition term equalities
-        partitionSimple, partitionComplex,
-
-        -- Predicates
-        isTruePmExpr, isFalsePmExpr, isNotPmExprOther,
-
-        -- Substitution in PmExpr
-        substSimpleEqs, substComplexEq,
-        idSubstVarEq, idSubstSimpleEq, idSubstComplexEq,
-
-        -- Substitution with confirmation
-        substPmExprB, substComplexEqB,
-
-        -- Lift (HsExpr Id) to PmExpr
-        hsExprToPmExpr, lhsExprToPmExpr,
-
-        -- Pretty printing
-        filterComplex, runPmPprM, pprPmExprWithParens,
-
-        -- Misc
-        truePmExpr, falsePmExpr, toComplex, eqPmLit
+        PmExpr(..), PmLit(..), SimpleEq, ComplexEq, eqPmLit,
+        truePmExpr, falsePmExpr, isTruePmExpr, isFalsePmExpr, isNotPmExprOther,
+        lhsExprToPmExpr, hsExprToPmExpr, substComplexEq, filterComplex,
+        pprPmExprWithParens, runPmPprM
     ) where
 
 #include "HsVersions.h"
 
-import Type
 import HsSyn
 import Id
 import DataCon
@@ -50,7 +28,7 @@ import FastString -- sLit
 import VarSet
 
 import Data.Maybe (mapMaybe)
-import Data.List (groupBy, sortBy, nub)
+import Data.List (groupBy, sortBy)
 import Control.Monad.Trans.State.Lazy
 
 {-
@@ -112,7 +90,6 @@ nubPmLit (x:xs) = x : nubPmLit (filter (not . eqPmLit x) xs)
 -- ----------------------------------------------------------------------------
 -- | Term equalities
 
-type VarEq     = (Id, Id)
 type SimpleEq  = (Id, PmExpr) -- We always use this orientation
 type ComplexEq = (PmExpr, PmExpr)
 
@@ -125,34 +102,6 @@ truePmExpr = PmExprCon trueDataCon []
 
 falsePmExpr :: PmExpr
 falsePmExpr = PmExprCon falseDataCon []
-
--- | Not actually a ComplexEq, we just wrap it with a PmExprVar
-toComplex :: SimpleEq -> ComplexEq
-toComplex (x,e) = (PmExprVar x, e)
-
--- ----------------------------------------------------------------------------
--- | Partitioning equalities (VarEq, SimpleEq, ComplexEq and Unhandled Eqs)
-
-partitionSimple :: [SimpleEq] -> ([VarEq], [SimpleEq], [SimpleEq])
-partitionSimple in_cs = foldr select ([],[],[]) in_cs
-  where
-    select eq@(x,e) ~(var_eqs, other_eqs, res_eqs)
-      | PmExprVar y   <- e = ((x,y):var_eqs,    other_eqs,    res_eqs)
-      | PmExprOther _ <- e = (      var_eqs,    other_eqs, eq:res_eqs)
-      | otherwise          = (      var_eqs, eq:other_eqs,    res_eqs)
-
-partitionComplex :: [ComplexEq] -> ([VarEq], [SimpleEq], [ComplexEq], [SimpleEq])
-partitionComplex in_cs = foldr select ([],[],[],[]) in_cs
-  where
-    select eq@(e1,e2) ~(var_eqs, simpl_eqs, other_eqs, res_eqs)
-      | PmExprVar x <- e1 = selectSimple x e2 (var_eqs, simpl_eqs, other_eqs, res_eqs)
-      | PmExprVar y <- e2 = selectSimple y e1 (var_eqs, simpl_eqs, other_eqs, res_eqs)
-      | otherwise         = (var_eqs, simpl_eqs, eq:other_eqs, res_eqs)
-
-    selectSimple x e ~(var_eqs, simpl_eqs, other_eqs, res_eqs)
-      | PmExprVar y   <- e = ((x,y):var_eqs,       simpl_eqs, other_eqs,       res_eqs)
-      | PmExprOther _ <- e = (      var_eqs,       simpl_eqs, other_eqs, (x,e):res_eqs)
-      | otherwise          = (      var_eqs, (x,e):simpl_eqs, other_eqs,       res_eqs)
 
 -- ----------------------------------------------------------------------------
 -- | Predicates
@@ -197,76 +146,26 @@ isConsDataCon con = consDataCon == con
 -- ----------------------------------------------------------------------------
 -- | Substitution in PmExpr
 
-substPmExpr :: Id -> PmExpr -> PmExpr -> PmExpr
+substPmExpr :: Id -> PmExpr -> PmExpr -> (PmExpr, Bool) -- did anything happen or was it for nothing?
 substPmExpr x e1 e =
-  case e of
-    PmExprVar z | x == z    -> e1
-                | otherwise -> e
-    PmExprCon c ps -> PmExprCon c (map (substPmExpr x e1) ps)
-    PmExprEq ex ey -> PmExprEq (substPmExpr x e1 ex) (substPmExpr x e1 ey)
-    _other_expr    -> e -- The rest are terminals -- we silently ignore
-                        -- PmExprOther. See NOTE [PmExprOther in PmExpr]
-
--- ----------------------------------------------------------------------------
--- ----------------------------------------------------------------------------
-substPmExprB :: Id -> PmExpr -> PmExpr -> (PmExpr, Bool) -- did anything happen or was it for nothing?
-substPmExprB x e1 e =
   case e of
     PmExprVar z | x == z    -> (e1, True)
                 | otherwise -> (e, False)
-    PmExprCon c ps -> let (ps', bs) = mapAndUnzip (substPmExprB x e1) ps
+    PmExprCon c ps -> let (ps', bs) = mapAndUnzip (substPmExpr x e1) ps
                       in  (PmExprCon c ps', or bs)
-    PmExprEq ex ey -> let (ex', bx) = substPmExprB x e1 ex
-                          (ey', by) = substPmExprB x e1 ey
+    PmExprEq ex ey -> let (ex', bx) = substPmExpr x e1 ex
+                          (ey', by) = substPmExpr x e1 ey
                       in  (PmExprEq ex' ey', bx || by)
     _other_expr    -> (e, False) -- The rest are terminals -- we silently ignore
                                  -- PmExprOther. See NOTE [PmExprOther in PmExpr]
 
-substComplexEqB :: Id -> PmExpr -> ComplexEq -> Either ComplexEq ComplexEq -- Left: something changed, Right: no worries
-substComplexEqB x e (ex, ey)
+substComplexEq :: Id -> PmExpr -> ComplexEq -> Either ComplexEq ComplexEq -- Left: something changed, Right: no worries
+substComplexEq x e (ex, ey)
   | bx || by  = Left  (ex', ey')
   | otherwise = Right (ex', ey')
   where
-    (ex', bx) = substPmExprB x e ex
-    (ey', by) = substPmExprB x e ey
--- ----------------------------------------------------------------------------
--- ----------------------------------------------------------------------------
-
-idSubstPmExpr :: (Id -> Id) -> PmExpr -> PmExpr
-idSubstPmExpr fn e =
-  case e of
-    PmExprVar z    -> PmExprVar (fn z)
-    PmExprCon c es -> PmExprCon c (map (idSubstPmExpr fn) es)
-    PmExprEq e1 e2 -> PmExprEq (idSubstPmExpr fn e1) (idSubstPmExpr fn e2)
-    _other_expr    -> e -- The rest are terminals -- we silently ignore
-                        -- PmExprOther. See NOTE [PmExprOther in PmExpr]
-
--- ----------------------------------------------------------------------------
--- | Substitution in term equalities
-
-idSubstVarEq :: (Id -> Id) -> VarEq -> VarEq
-idSubstVarEq fn (x, y) = (fn x, fn y)
-
-idSubstSimpleEq :: (Id -> Id) -> SimpleEq -> SimpleEq
-idSubstSimpleEq fn (x,e) = (fn x, idSubstPmExpr fn e)
-
-idSubstComplexEq :: (Id -> Id) -> ComplexEq -> ComplexEq
-idSubstComplexEq fn (e1,e2) = (idSubstPmExpr fn e1, idSubstPmExpr fn e2)
-
-substComplexEq :: Id -> PmExpr -> ComplexEq -> ComplexEq
-substComplexEq x e (e1, e2) = (substPmExpr x e e1, substPmExpr x e e2)
-
--- | Substitute in simple equalities and partition them to the ones that
--- remain simple and the ones that become complex.
-substSimpleEqs :: Id -> PmExpr -> [SimpleEq] -> ([SimpleEq], [ComplexEq])
-substSimpleEqs _ _ [] = ([],[])
-substSimpleEqs x e ((y,e1):rest)
-  | x == y = case e of
-      PmExprVar z -> ((z, e2):simple_eqs, complex_eqs)
-      _other_expr -> (simple_eqs, (e, e2):complex_eqs)
-  | otherwise      = ((y, e2):simple_eqs, complex_eqs)
-  where (simple_eqs, complex_eqs) = substSimpleEqs x e rest
-        e2 = substPmExpr x e e1
+    (ex', bx) = substPmExpr x e ex
+    (ey', by) = substPmExpr x e ey
 
 -- -----------------------------------------------------------------------
 -- | Lift source expressions (HsExpr Id) to PmExpr
@@ -418,19 +317,19 @@ pprPmExpr (PmExprVar x) = do
   mb_name <- checkNegation x
   case mb_name of
     Just name -> addUsed x >> return name
-    Nothing   -> return $ if debugIsOn then ppr x
-                                       else underscore
+    Nothing   -> return $ {- if debugIsOn then -} ppr x
+                                       -- else underscore
 pprPmExpr (PmExprCon con args) = pprPmExprCon con args
 pprPmExpr (PmExprLit l) = return (ppr l)
 pprPmExpr (PmExprEq e1 e2)
-  | debugIsOn = do
+  {- | debugIsOn -} = do
       e1' <- pprPmExpr e1
       e2' <- pprPmExpr e2
       return $ braces (e1' <+> equals <+> e2')
-  | otherwise = return underscore
+  -- | otherwise = return underscore
 pprPmExpr (PmExprOther e)
-  | debugIsOn = return (ppr e)
-  | otherwise = return underscore
+  {- | debugIsOn -} = return (braces $ ppr e)
+  -- | otherwise = return underscore
 
 needsParens :: PmExpr -> Bool
 needsParens (PmExprVar   {}) = False

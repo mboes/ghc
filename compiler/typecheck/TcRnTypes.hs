@@ -92,7 +92,7 @@ module TcRnTypes(
         pprArising, pprArisingAt,
 
         -- Debugging
-        pprInTcRnIf,
+        pprInTcRnIf, pprSDocUnsafeAnd,
 
         -- Misc other types
         TcId, TcIdSet, HoleSort(..)
@@ -150,6 +150,10 @@ import Data.Typeable ( TypeRep )
 
 import qualified Language.Haskell.TH as TH
 #endif
+
+-- still debugging
+import System.IO.Unsafe (unsafePerformIO)
+
 
 {-
 ************************************************************************
@@ -2239,4 +2243,7 @@ pprInTcRnIf :: SDoc -> TcRnIf gbl lcl ()
 pprInTcRnIf doc = do
   dflags <- getDynFlags
   liftIO (putStrLn (showSDoc dflags doc))
+
+pprSDocUnsafeAnd :: SDoc -> a -> a
+pprSDocUnsafeAnd doc x = unsafePerformIO (putStrLn (showSDocSimple doc)) `seq` x
 

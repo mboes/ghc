@@ -52,6 +52,8 @@ import Data.List     -- find
 import Data.Maybe    -- isNothing, isJust, fromJust
 import Control.Monad -- liftM3, forM
 
+import TcRnTypes ( pprInTcRnIf, pprSDocUnsafeAnd )
+
 {-
 This module checks pattern matches for:
 \begin{enumerate}
@@ -137,7 +139,7 @@ checkSingle var p = do
   vec <- liftUs (translatePat p)
   vsa <- initial_uncovered [var]
   (c,d,us') <- patVectProc (vec,[]) vsa -- no guards
-  us <- pruneValSetAbsNew us'
+  us <- pruneValSetAbs us'
   return $ case (c,d) of
     (True,  _)     -> ([],   [],   us)
     (False, True)  -> ([],   [lp], us)
@@ -153,7 +155,7 @@ checkMatches vars matches
       return (map hsLMatchPats rs, map hsLMatchPats is, us)
   where
     go [] missing = do
-      missing' <- pruneValSetAbsNew missing
+      missing' <- pruneValSetAbs missing
       return ([], [], missing')
 
     go (m:ms) missing = do
@@ -749,65 +751,20 @@ splitConstraints (c : rest)
 %************************************************************************
 -}
 
--- || -- let's check performance
--- || satisfiable :: [PmConstraint] -> PmM (Maybe ([ComplexEq], PmVarEnv))
--- || satisfiable _ = return $ Just ([], Map.empty)
-
--- Same interface to check all kinds of different constraints like in the paper
-satisfiable :: [PmConstraint] -> PmM (Maybe ([ComplexEq], PmVarEnv)) -- Bool -- Give back the substitution for pretty-printing
-satisfiable constraints = do
-  let (ty_cs, tm_cs, bot_cs) = splitConstraints constraints
-  sat <- tyOracle (listToBag ty_cs)
-  case sat of
-    True -> case tmOracle tm_cs of
-      Left _eq -> return Nothing
-      Right (residual, (expr_eqs, mapping)) ->
-        let answer = isNothing bot_cs || -- just term eqs ==> OK (success)
-                     notNull residual || -- something we cannot reason about -- gives inaccessible while it shouldn't
-                     notNull expr_eqs || -- something we cannot reason about
-                     notForced (fromJust bot_cs) mapping -- Was not evaluated before
-        in  return $ if answer then Just (residual, flattenPmVarEnv mapping) -- flatten the DAG
-                               else Nothing
-    False -> return Nothing -- inconsistent type constraints
-
--- | For coverage & laziness
--- True  => Set may be non-empty
--- False => Set is definitely empty
--- Fact:  anySatValSetAbs s = pruneValSetAbs /= Empty
---        (but we implement it directly for efficiency)
 anySatValSetAbs :: ValSetAbs -> PmM Bool
-anySatValSetAbs = anySatValSetAbs' []
-  where
-    anySatValSetAbs' :: [PmConstraint] -> ValSetAbs -> PmM Bool
-    anySatValSetAbs' _cs Empty                = return False
-    anySatValSetAbs'  cs (Union vsa1 vsa2)    = anySatValSetAbs' cs vsa1 `orM` anySatValSetAbs' cs vsa2
-    anySatValSetAbs'  cs Singleton            = isJust <$> satisfiable cs
-    anySatValSetAbs'  cs (Constraint cs' vsa) = anySatValSetAbs' (cs' ++ cs) vsa -- in front for faster concatenation
-    anySatValSetAbs'  cs (Cons _va vsa)       = anySatValSetAbs' cs vsa
+anySatValSetAbs vsa = isNotEmpty <$> pruneValSetAbsBound 1 vsa
 
--- | For exhaustiveness check
--- Prune the set by removing unsatisfiable paths
+-- TAKE THE INT AS AN ARGUMENT
 pruneValSetAbs :: ValSetAbs -> PmM [(ValVecAbs,([ComplexEq], PmVarEnv))]
-pruneValSetAbs = mapMaybeM sat . valSetAbsToList
-  where
-    sat (vec, cs) = ((\vsa -> (vec,vsa))<$>) <$> satisfiable cs
-
--- | Trying something more incremental
--- ----------------------------------------------------------------------------
-
-anySatValSetAbsNew :: ValSetAbs -> PmM Bool
-anySatValSetAbsNew vsa = isNotEmpty <$> pruneValSetAbsBound 1 vsa
-
-pruneValSetAbsNew :: ValSetAbs -> PmM [(ValVecAbs,([ComplexEq], PmVarEnv))]
-pruneValSetAbsNew = pruneValSetAbsBoundVec 4
+pruneValSetAbs vsa = pruneValSetAbsBoundVec 4 vsa
 
 pruneValSetAbsBound :: Int -> ValSetAbs -> PmM ValSetAbs
 pruneValSetAbsBound n v = fst <$> pruneValSetAbsBound' n init_cs v
   where
-    init_cs :: ([EvVar], IncrState, Maybe Id)
-    init_cs = ([], initialIncrState, Nothing)
+    init_cs :: ([EvVar], TmState, Maybe Id)
+    init_cs = ([], initialTmState, Nothing)
 
-    pruneValSetAbsBound' :: Int -> ([EvVar], IncrState, Maybe Id) -> ValSetAbs -> PmM (ValSetAbs, Int) -- how many left. @$#%$ Union!
+    pruneValSetAbsBound' :: Int -> ([EvVar], TmState, Maybe Id) -> ValSetAbs -> PmM (ValSetAbs, Int) -- how many left. @$#%$ Union!
     pruneValSetAbsBound' n all_cs@(ty_cs, tm_env, bot_ct) in_vsa
       | n <= 0    = return (Empty, 0) -- no need to keep going
       | otherwise = case in_vsa of
@@ -822,7 +779,7 @@ pruneValSetAbsBound n v = fst <$> pruneValSetAbsBound' n init_cs v
               True  -> (Singleton, n-1)
               False -> (Empty, n)
           Constraint cs vsa -> case splitConstraints cs of -- undefined {- FIXME -}
-            (new_ty_cs, new_tm_cs, new_bot_ct) -> case tmOracleIncr tm_env new_tm_cs of
+            (new_ty_cs, new_tm_cs, new_bot_ct) -> case tmOracle tm_env new_tm_cs of
               Just (new_tm_env@(residual, (expr_eqs, subst))) ->
                 let bot = mergeBotCs new_bot_ct bot_ct
                     ans = isNothing bot || notNull residual || notNull expr_eqs || notForced (fromJust bot) subst
@@ -840,16 +797,16 @@ mergeBotCs Nothing  (Just y) = Just y
 mergeBotCs Nothing  Nothing  = Nothing
 mergeBotCs (Just _) (Just _) = panic "mergeBotCs: two (x ~ _|_) constraints"
 
-wrapUpIncrState :: IncrState -> ([ComplexEq], PmVarEnv)
-wrapUpIncrState (residual, (_unhandled, subst)) = (residual, flattenPmVarEnv subst)
+wrapUpTmState :: TmState -> ([ComplexEq], PmVarEnv)
+wrapUpTmState (residual, (_unhandled, subst)) = (residual, flattenPmVarEnv subst)
 
 pruneValSetAbsBoundVec :: Int -> ValSetAbs -> PmM [(ValVecAbs,([ComplexEq], PmVarEnv))]
 pruneValSetAbsBoundVec n v = fst <$> pruneValSetAbsBoundVec' n init_cs emptylist v
   where
-    init_cs :: ([EvVar], IncrState, Maybe Id)
-    init_cs = ([], initialIncrState, Nothing)
+    init_cs :: ([EvVar], TmState, Maybe Id)
+    init_cs = ([], initialTmState, Nothing)
 
-    pruneValSetAbsBoundVec' :: Int -> ([EvVar], IncrState, Maybe Id) -> DList ValAbs -> ValSetAbs -> PmM ([(ValVecAbs,([ComplexEq], PmVarEnv))], Int)
+    pruneValSetAbsBoundVec' :: Int -> ([EvVar], TmState, Maybe Id) -> DList ValAbs -> ValSetAbs -> PmM ([(ValVecAbs,([ComplexEq], PmVarEnv))], Int)
     pruneValSetAbsBoundVec' n all_cs@(ty_cs, tm_env, bot_ct) vec in_vsa
       | n <= 0    = return ([], 0) -- no need to keep going
       | otherwise = case in_vsa of
@@ -861,17 +818,17 @@ pruneValSetAbsBoundVec n v = fst <$> pruneValSetAbsBoundVec' n init_cs emptylist
           Singleton -> do -- return (Singleton, n-1)
             sat <- tyOracle (listToBag ty_cs) -- it would be nice to have this incremental too
             return $ case sat of
-              True  -> ([(toList vec, wrapUpIncrState tm_env)], n-1)
+              True  -> ([(toList vec, wrapUpTmState tm_env)], n-1)
               False -> ([], n)
           Constraint cs vsa -> case splitConstraints cs of -- undefined {- FIXME -}
-            (new_ty_cs, new_tm_cs, new_bot_ct) -> case tmOracleIncr tm_env new_tm_cs of
-              Just (new_tm_env@(residual, (expr_eqs, subst))) ->
-                let bot = mergeBotCs new_bot_ct bot_ct
-                    ans = isNothing bot || notNull residual || notNull expr_eqs || notForced (fromJust bot) subst
-                in  case ans of
-                      True  -> pruneValSetAbsBoundVec' n (new_ty_cs++ty_cs, new_tm_env, bot) vec vsa
-                      False -> return ([], n)
-              Nothing -> return ([], n)
+            (new_ty_cs, new_tm_cs, new_bot_ct) -> case tmOracle tm_env new_tm_cs of
+                Just (new_tm_env@(residual, (expr_eqs, subst))) ->
+                  let bot = mergeBotCs new_bot_ct bot_ct
+                      ans = isNothing bot || notNull residual || notNull expr_eqs || notForced (fromJust bot) subst
+                  in  case ans of
+                        True  -> pruneValSetAbsBoundVec' n (new_ty_cs++ty_cs, new_tm_env, bot) vec vsa
+                        False -> return ([], n)
+                Nothing -> return ([], n)
           Cons va vsa -> pruneValSetAbsBoundVec' n all_cs (vec `snoc` va) vsa
 
 isNotEmpty :: ValSetAbs -> Bool
@@ -956,8 +913,8 @@ patVectProc (vec,gvs) vsa = do
   us <- getUniqueSupplyM
   let (c_def, u_def, d_def) = process_guards us gvs -- default (the continuation)
   (usC, usU, usD) <- getUniqueSupplyM3
-  mb_c <- anySatValSetAbsNew (covered   usC c_def vec vsa)
-  mb_d <- anySatValSetAbsNew (divergent usD d_def vec vsa)
+  mb_c <- anySatValSetAbs (covered   usC c_def vec vsa)
+  mb_d <- anySatValSetAbs (divergent usD d_def vec vsa)
   let vsa' = uncovered usU u_def vec vsa
   return (mb_c, mb_d, vsa')
 
@@ -999,8 +956,13 @@ pmTraverse us gvsa rec (p:ps) vsa =
       let (us1, us2) = splitUniqSupply us
           y  = mkPmId us1 (patternType p)
           cs = [TmConstraint y e]
-      in  mkConstraint cs $ tailValSetAbs $
-            pmTraverse us2 gvsa rec (pv++ps) (VA (PmVar y) `mkCons` vsa)
+          (message, new_cs) = case isPmExprOtherWithVar e of
+            Nothing -> (empty, cs)
+            Just e' -> ((ptext (sLit "pmTraverse: needs fixing:") <+> (ppr y <+> ptext (sLit "=||=") <+> ppr e)) $$ (ptext (sLit "Fixed?:") <+> (ppr y <+> ptext (sLit "=||=") <+> ppr e') ), [TmConstraint y e'])
+
+      in  message -- (ptext (sLit "pmTraverse: Adding constraint:") <+> ppr y <+> ptext (sLit "=||=") <+> ppr e)
+            `pprSDocUnsafeAnd` (mkConstraint new_cs $ tailValSetAbs $ pmTraverse us2 gvsa rec (pv++ps) (VA (PmVar y) `mkCons` vsa))
+
     -- Constructor/Variable/Literal Case
     NonGuard pat
       | Cons (VA va) vsa <- vsa -> rec us gvsa pat ps va vsa
@@ -1193,6 +1155,12 @@ dMatcher us gvsa (PmLit l) ps (PmVar x) vsa
 %************************************************************************
 -}
 
+-- instance Outputable PmConstraint where
+--   ppr (TmConstraint x e)   = ptext (sLit "{|") <> ppr x <+> ptext (sLit "=:=") <+> ppr e <> ptext (sLit "|}")
+--   ppr (TyConstraint ty_cs) | null ty_cs = empty
+--                            | otherwise  = braces $ interpp'SP $ map idType ty_cs
+--   ppr (BtConstraint x)     = ptext (sLit "{|") <> ppr x <+> ptext (sLit "~ _|_") <> ptext (sLit "|}")
+
 instance Outputable ValAbs where
   ppr = ppr . valAbsToPmExpr
 
@@ -1204,7 +1172,7 @@ ppr_constraint (var, lits) = var <+> ptext (sLit "is not one of") <+> ppr lits
 
 pprOne :: (ValVecAbs,([ComplexEq], PmVarEnv)) -> SDoc
 pprOne (vs,(complex, subst)) =
-  let expr_vec = map (getValuePmExpr subst . valAbsToPmExpr) vs -- vec as a list of expressions (apply the subst returned by the solver,  ValAbs <: PmExpr)
+  let expr_vec = map (exprDeepLookup subst . valAbsToPmExpr) vs -- vec as a list of expressions (apply the subst returned by the solver,  ValAbs <: PmExpr)
       sdoc_vec = mapM pprPmExprWithParens expr_vec
       (vec,cs) = runPmPprM sdoc_vec (filterComplex complex)
   in  if null cs
