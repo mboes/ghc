@@ -17,10 +17,7 @@ module TmOracle (
         tmOracle, TmState, initialTmState,
 
         -- misc.
-        exprDeepLookup, pmLitType, flattenPmVarEnv,
-
-        -- DEBUGGING
-        isPmExprOtherWithVar
+        exprDeepLookup, pmLitType, flattenPmVarEnv
     ) where
 
 #include "HsVersions.h"
@@ -39,11 +36,6 @@ import Util
 
 import qualified Data.Map as Map
 import Data.Maybe
-
--- still debugging
-import TcRnTypes (pprSDocUnsafeAnd)
-import System.IO.Unsafe (unsafePerformIO)
-import HsSyn
 
 {-
 %************************************************************************
@@ -114,10 +106,8 @@ solveComplexEq solver_state@(standby, (unhandled, env)) eq@(e1, e2) = case eq of
     | c == falseDataCon -> Just (eq:standby, (unhandled, env))
 
   (PmExprVar x, PmExprVar y)
-    | x == y    -> (unsafePerformIO . putStrLn . ("deemed equal: "++) . showSDocSimple) (ppr x <+> ptext (sLit "and") <+> ppr y)
-                     `seq` Just solver_state
-
-    | otherwise -> ASSERT (isNothing (Map.lookup x env) && isNothing (Map.lookup y env))  extendSubstAndSolve x e2 solver_state {- CHOOSE ONE AND EXTEND SUBST & LOOK AT STB -}
+    | x == y    -> Just solver_state
+    | otherwise -> extendSubstAndSolve x e2 solver_state {- CHOOSE ONE AND EXTEND SUBST & LOOK AT STB -}
 
   (PmExprVar x, _) -> extendSubstAndSolve x e2 solver_state {- EXTEND SUBST & LOOK AT STB -}
   (_, PmExprVar x) -> extendSubstAndSolve x e1 solver_state {- EXTEND SUBST & LOOK AT STB -}
@@ -213,26 +203,7 @@ exprDeepLookup _   other_expr       = other_expr -- lit ==> lit, expr_other ==> 
 -- | External interface to the solver
 -- ----------------------------------------------------------------------------
 tmOracle :: TmState -> [SimpleEq] -> Maybe TmState
-tmOracle env eqs =  foldlM solveSimpleEqWithShow env eqs
-  where
-    solveSimpleEqWithShow :: TmState -> SimpleEq -> Maybe TmState
-    solveSimpleEqWithShow s@(_,(_,subst)) eq@(var, expr)
-      = let eq_str    = showSDocSimple (ppr eq)
-            subst_str = showSDocSimple (ppr subst)
-            message_1 =  "InitSubst : " ++ subst_str ++ "\n"
-                      ++ "Processing: " ++ eq_str -- PRINT THE ORIGINAL THOUGH
-            mb_result = solveSimpleEq s eq' -- USE THE **HOPE-FIXED** ONE
-            (string, eq') = case isPmExprOtherWithVar expr of
-                              Nothing -> (empty, eq)
-                              Just y  -> (ptext (sLit "GOT TRASH:") <+> ppr eq <+> ptext (sLit "is it fixed now?:") <+> ppr (var, y), (var, y))
-        in  string `pprSDocUnsafeAnd`
-                      case mb_result of
-                        Nothing             -> unsafePerformIO (putStrLn message_1 >> putStrLn "Fails")                                    `seq` mb_result
-                        Just (_,(_,subst')) -> unsafePerformIO (putStrLn message_1 >> putStrLn ("Gives: " ++ showSDocSimple (ppr subst'))) `seq` mb_result
-
-isPmExprOtherWithVar :: PmExpr -> Maybe PmExpr
-isPmExprOtherWithVar (PmExprOther (HsVar x)) = Just (PmExprVar x)
-isPmExprOtherWithVar _                       = Nothing
+tmOracle = foldlM solveSimpleEq
 
 -- ----------------------------------------------------------------------------
 

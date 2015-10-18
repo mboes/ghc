@@ -92,7 +92,7 @@ module TcRnTypes(
         pprArising, pprArisingAt,
 
         -- Debugging
-        pprInTcRnIf, pprSDocUnsafeAnd,
+        pprInTcRnIf,
 
         -- Misc other types
         TcId, TcIdSet, HoleSort(..)
@@ -2243,7 +2243,3 @@ pprInTcRnIf :: SDoc -> TcRnIf gbl lcl ()
 pprInTcRnIf doc = do
   dflags <- getDynFlags
   liftIO (putStrLn (showSDoc dflags doc))
-
-pprSDocUnsafeAnd :: SDoc -> a -> a
-pprSDocUnsafeAnd doc x = unsafePerformIO (putStrLn (showSDocSimple doc)) `seq` x
-

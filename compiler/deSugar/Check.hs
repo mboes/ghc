@@ -52,8 +52,6 @@ import Data.List     -- find
 import Data.Maybe    -- isNothing, isJust, fromJust
 import Control.Monad -- liftM3, forM
 
-import TcRnTypes ( pprInTcRnIf, pprSDocUnsafeAnd )
-
 {-
 This module checks pattern matches for:
 \begin{enumerate}
@@ -290,7 +288,7 @@ translatePat pat = case pat of
         (xp, xe) <- mkPmId2FormsSM pat_ty
         ps       <- translatePatVec (map unLoc lpats) -- list as value abstraction
         let pats = foldr (mkListPatVec elem_ty) [nilPattern elem_ty] ps
-            g  = mkGuard pats (HsApp (noLoc to_list) xe) -- [...] <- toList x
+            g  = mkGuard pats (HsApp (noLoc to_list) xe) -- [...] <- toList x -- THIS IS WRONG
         return [xp,g]
 
   ConPatOut { pat_con = L _ (PatSynCon _) } -> do
@@ -956,12 +954,8 @@ pmTraverse us gvsa rec (p:ps) vsa =
       let (us1, us2) = splitUniqSupply us
           y  = mkPmId us1 (patternType p)
           cs = [TmConstraint y e]
-          (message, new_cs) = case isPmExprOtherWithVar e of
-            Nothing -> (empty, cs)
-            Just e' -> ((ptext (sLit "pmTraverse: needs fixing:") <+> (ppr y <+> ptext (sLit "=||=") <+> ppr e)) $$ (ptext (sLit "Fixed?:") <+> (ppr y <+> ptext (sLit "=||=") <+> ppr e') ), [TmConstraint y e'])
-
-      in  message -- (ptext (sLit "pmTraverse: Adding constraint:") <+> ppr y <+> ptext (sLit "=||=") <+> ppr e)
-            `pprSDocUnsafeAnd` (mkConstraint new_cs $ tailValSetAbs $ pmTraverse us2 gvsa rec (pv++ps) (VA (PmVar y) `mkCons` vsa))
+      in  mkConstraint cs $ tailValSetAbs $
+            pmTraverse us2 gvsa rec (pv++ps) (VA (PmVar y) `mkCons` vsa)
 
     -- Constructor/Variable/Literal Case
     NonGuard pat

@@ -217,7 +217,7 @@ hsExprToPmExpr (HsSCC             _ e) = lhsExprToPmExpr e
 hsExprToPmExpr (HsCoreAnn         _ e) = lhsExprToPmExpr e
 hsExprToPmExpr (ExprWithTySig   e _ _) = lhsExprToPmExpr e
 hsExprToPmExpr (ExprWithTySigOut  e _) = lhsExprToPmExpr e
-
+hsExprToPmExpr (HsWrap            _ e) =  hsExprToPmExpr e -- DROP THE DAMN WRAPPER
 hsExprToPmExpr e = PmExprOther e -- the rest are not handled by the oracle
 
 {-
