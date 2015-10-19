@@ -780,7 +780,7 @@ pruneValSetAbsBound n v = fst <$> pruneValSetAbsBound' n init_cs v
             (new_ty_cs, new_tm_cs, new_bot_ct) -> case tmOracle tm_env new_tm_cs of
               Just (new_tm_env@(residual, (expr_eqs, subst))) ->
                 let bot = mergeBotCs new_bot_ct bot_ct
-                    ans = isNothing bot || notNull residual || notNull expr_eqs || notForced (fromJust bot) subst
+                    ans = isNothing bot || notNull residual || expr_eqs || notForced (fromJust bot) subst
                 in  case ans of
                       True  -> pruneValSetAbsBound' n (new_ty_cs++ty_cs, new_tm_env, bot) vsa
                       False -> return (Empty, n)
@@ -822,7 +822,7 @@ pruneValSetAbsBoundVec n v = fst <$> pruneValSetAbsBoundVec' n init_cs emptylist
             (new_ty_cs, new_tm_cs, new_bot_ct) -> case tmOracle tm_env new_tm_cs of
                 Just (new_tm_env@(residual, (expr_eqs, subst))) ->
                   let bot = mergeBotCs new_bot_ct bot_ct
-                      ans = isNothing bot || notNull residual || notNull expr_eqs || notForced (fromJust bot) subst
+                      ans = isNothing bot || notNull residual || expr_eqs || notForced (fromJust bot) subst
                   in  case ans of
                         True  -> pruneValSetAbsBoundVec' n (new_ty_cs++ty_cs, new_tm_env, bot) vec vsa
                         False -> return ([], n)

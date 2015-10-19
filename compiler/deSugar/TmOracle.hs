@@ -29,13 +29,13 @@ import TysWiredIn
 import Type    -- ( Type )
 import HsLit   -- overLitType
 import TcHsSyn -- hsLitType
-import FastString -- sLit
-import Outputable
+-- import FastString -- sLit
+-- import Outputable
 import MonadUtils
 import Util
 
 import qualified Data.Map as Map
-import Data.Maybe
+-- import Data.Maybe
 
 {-
 %************************************************************************
@@ -51,9 +51,9 @@ import Data.Maybe
 type PmVarEnv = Map.Map Id PmExpr
 
 -- | The environment of the oracle contains
---     1. A set of constraints that cannot be handled (PmExprOther stuff).
+--     1. A boolean value (are there any constraints we cannot handle? (PmExprOther stuff)).
 --     2. A substitution we extend with every step and return as a result.
-type TmOracleEnv = ([ComplexEq], PmVarEnv)
+type TmOracleEnv = (Bool, PmVarEnv)
 
 
 -- | Check whether a variable has been refined to (at least) a WHNF
@@ -68,13 +68,10 @@ flattenPmVarEnv env = Map.map (exprDeepLookup env) env
 
 -- ----------------------------------------------------------------------------
 
-type TmState = ( [ComplexEq]   -- constraints that cannot be solved yet (we need more info)
-               , TmOracleEnv ) -- ([ComplexEq], PmVarEnv == Map Id PmExpr)
-                               --   1. A set of constraints that cannot be handled (PmExprOther stuff).
-                               --   2. A substitution we extend with every step
+type TmState = ([ComplexEq], TmOracleEnv)  -- constraints that cannot be solved yet (we need more info) and subst
 
 initialTmState :: TmState
-initialTmState = ([], ([], Map.empty))
+initialTmState = ([], (False, Map.empty))
 
 solveSimpleEq :: TmState -> SimpleEq -> Maybe TmState
 solveSimpleEq solver_env@(_,(_,env)) simple
@@ -85,8 +82,8 @@ solveSimpleEq solver_env@(_,(_,env)) simple
 solveComplexEq :: TmState -> ComplexEq -> Maybe TmState
 solveComplexEq solver_state@(standby, (unhandled, env)) eq@(e1, e2) = case eq of
   -- We cannot do a thing about these cases
-  (PmExprOther _,_)            -> Just (standby, (eq:unhandled, env))
-  (_,PmExprOther _)            -> Just (standby, (eq:unhandled, env))
+  (PmExprOther _,_)            -> Just (standby, (True, env))
+  (_,PmExprOther _)            -> Just (standby, (True, env))
   -- Look at the catch-all.. (PmExprLit _, PmExprCon _ _) -> Just (standby, (eq:unhandled, env))
   -- Look at the catch-all.. (PmExprCon _ _, PmExprLit _) -> Just (standby, (eq:unhandled, env))
   -- Look at the catch-all.. (PmExprLit _, PmExprEq _ _)  -> Just (standby, (eq:unhandled, env))
@@ -94,7 +91,7 @@ solveComplexEq solver_state@(standby, (unhandled, env)) eq@(e1, e2) = case eq of
 
   (PmExprLit l1, PmExprLit l2)
     | eqPmLit l1 l2 -> Just solver_state
-    | otherwise     -> Nothing
+    | otherwise     -> Nothing -- THIS IS NOT EXACTLY TRUE. FOR OVERLOADED WE DO NOT KNOW MUCH
   (PmExprCon c1 ts1, PmExprCon c2 ts2)
     | c1 == c2  -> foldlM solveComplexEq solver_state (zip ts1 ts2)
     | otherwise -> Nothing
@@ -120,7 +117,7 @@ solveComplexEq solver_state@(standby, (unhandled, env)) eq@(e1, e2) = case eq of
 
   (PmExprEq _ _, PmExprEq _ _) -> Just (eq:standby, (unhandled, env))
 
-  _ -> Just (standby, (eq:unhandled, env)) -- I HATE CATCH-ALLS
+  _ -> Just (standby, (True, env)) -- I HATE CATCH-ALLS
 
 extendSubstAndSolve :: Id -> PmExpr -> TmState -> Maybe TmState
 extendSubstAndSolve x e (standby, (unhandled, env))
