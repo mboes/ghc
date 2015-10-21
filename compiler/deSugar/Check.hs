@@ -1006,9 +1006,10 @@ cMatcher us gvsa (p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
                          (covered us gvsa (args1 ++ ps) (foldr mkCons vsa args2))
 
 -- CLitLit
-cMatcher us gvsa (PmLit l1) ps (va@(PmLit l2)) vsa
-  | eqPmLit l1 l2  = VA va `mkCons` covered us gvsa ps vsa
-  | otherwise      = Empty
+cMatcher us gvsa (PmLit l1) ps (va@(PmLit l2)) vsa = case eqPmLit l1 l2 of
+  Just True  -> VA va `mkCons` covered us gvsa ps vsa -- we know: match
+  Just False -> Empty                                 -- we know: no match
+  Nothing    -> VA va `mkCons` covered us gvsa ps vsa -- Don't even try putting a constraint in the bag, it won't reduce.
 
 -- CConVar
 cMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa
@@ -1058,9 +1059,10 @@ uMatcher us gvsa ( p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
                          (uncovered us gvsa (args1 ++ ps) (foldr mkCons vsa args2))
 
 -- ULitLit
-uMatcher us gvsa (PmLit l1) ps (va@(PmLit l2)) vsa
-  | eqPmLit l1 l2 = VA va `mkCons` uncovered us gvsa ps vsa
-  | otherwise     = VA va `mkCons` vsa
+uMatcher us gvsa (PmLit l1) ps (va@(PmLit l2)) vsa = case eqPmLit l1 l2 of
+  Just True  -> VA va `mkCons` uncovered us gvsa ps vsa -- we know: match
+  Just False -> VA va `mkCons` vsa                      -- we know: no match
+  Nothing    -> VA va `mkCons` vsa                      -- no clue: assume the worst?
 
 -- UConVar
 uMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa
@@ -1122,9 +1124,10 @@ dMatcher us gvsa (p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
                          (divergent us gvsa (args1 ++ ps) (foldr mkCons vsa args2))
 
 -- DLitLit
-dMatcher us gvsa (PmLit l1) ps (va@(PmLit l2)) vsa
-  | eqPmLit l1 l2 = VA va `mkCons` divergent us gvsa ps vsa
-  | otherwise     = Empty
+dMatcher us gvsa (PmLit l1) ps (va@(PmLit l2)) vsa = case eqPmLit l1 l2 of
+  Just True  -> VA va `mkCons` divergent us gvsa ps vsa -- we know: match
+  Just False -> Empty                                   -- we know: no match
+  Nothing    -> VA va `mkCons` divergent us gvsa ps vsa -- Don't even try putting a constraint in the bag, it won't reduce.
 
 -- DConVar
 dMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa

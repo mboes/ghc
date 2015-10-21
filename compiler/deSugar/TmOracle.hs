@@ -89,9 +89,13 @@ solveComplexEq solver_state@(standby, (unhandled, env)) eq@(e1, e2) = case eq of
   -- Look at the catch-all.. (PmExprLit _, PmExprEq _ _)  -> Just (standby, (eq:unhandled, env))
   -- Look at the catch-all.. (PmExprEq _ _, PmExprLit _)  -> Just (standby, (eq:unhandled, env))
 
-  (PmExprLit l1, PmExprLit l2)
-    | eqPmLit l1 l2 -> Just solver_state
-    | otherwise     -> Nothing -- THIS IS NOT EXACTLY TRUE. FOR OVERLOADED WE DO NOT KNOW MUCH
+  (PmExprLit l1, PmExprLit l2) -> case eqPmLit l1 l2 of
+    Just True  -> Just solver_state           -- we are sure: equal
+    Just False -> Nothing                     -- we are sure: not equal
+    -- Maybe just drop. We use this boolean to check also whether something is forced and I know
+    -- that nothing is if both are literals. Hence, just assume true and give (Just solver_state)?
+    Nothing    -> Just (standby, (True, env)) -- no clue (and won't get one)!
+
   (PmExprCon c1 ts1, PmExprCon c2 ts2)
     | c1 == c2  -> foldlM solveComplexEq solver_state (zip ts1 ts2)
     | otherwise -> Nothing
@@ -143,12 +147,16 @@ simplifyEqExpr e1 e2 = case (e1, e2) of
     | x == y -> (truePmExpr, True)
 
   -- Literals
-  (PmExprLit l1@(PmSLit {}), PmExprLit l2@(PmSLit {}))
-    | eqPmLit l1 l2 -> (truePmExpr,  True)
-    | otherwise     -> (falsePmExpr, True)
-  (PmExprLit l1@(PmOLit {}), PmExprLit l2@(PmOLit {}))
-    | eqPmLit l1 l2 -> (truePmExpr,  True)
-    | otherwise     -> (falsePmExpr, True)
+  (PmExprLit l1, PmExprLit l2) -> case eqPmLit l1 l2 of
+    Just True  -> (truePmExpr,  True)
+    Just False -> (falsePmExpr, True)
+    Nothing    -> (original,   False)
+  -- (PmExprLit l1@(PmSLit {}), PmExprLit l2@(PmSLit {}))
+  --   | eqPmLit l1 l2 -> (truePmExpr,  True)
+  --   | otherwise     -> (falsePmExpr, True)
+  -- (PmExprLit l1@(PmOLit {}), PmExprLit l2@(PmOLit {}))
+  --   | eqPmLit l1 l2 -> (truePmExpr,  True)
+  --   | otherwise     -> (falsePmExpr, True)
 
   -- simplify bottom-up
   (PmExprEq {}, _) -> case (simplifyPmExpr e1, simplifyPmExpr e2) of

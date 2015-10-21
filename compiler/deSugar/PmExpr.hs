@@ -76,16 +76,21 @@ data PmExpr = PmExprVar   Id
 data PmLit = PmSLit HsLit                                    -- simple
            | PmOLit Bool {- is it negated? -} (HsOverLit Id) -- overloaded
 
--- do not make it an instance of Eq, we just need it for printing
-eqPmLit :: PmLit -> PmLit -> Bool
-eqPmLit (PmSLit    l1) (PmSLit l2   ) = l1 == l2 -- check the instances too for lits and olits
-eqPmLit (PmOLit b1 l1) (PmOLit b2 l2) = b1 == b2 && l1 == l2
-eqPmLit _               _             = False
+-- do not make it an instance of Eq
+eqPmLit :: PmLit -> PmLit -> Maybe Bool
+eqPmLit (PmSLit    l1) (PmSLit l2   ) = Just (l1 == l2) -- check the instances too for lits and olits
+eqPmLit (PmOLit b1 l1) (PmOLit b2 l2) = if res then Just True else Nothing
+  where res = b1 == b2 && l1 == l2
+eqPmLit _ _ = Nothing
 
 nubPmLit :: [PmLit] -> [PmLit]
 nubPmLit []     = []
 nubPmLit [x]    = [x]
-nubPmLit (x:xs) = x : nubPmLit (filter (not . eqPmLit x) xs)
+nubPmLit (x:xs) = x : nubPmLit (filter (neqPmLit x) xs)
+  where neqPmLit l1 l2 = case eqPmLit l1 l2 of
+          Just True  -> False
+          Just False -> True
+          Nothing    -> True
 
 -- ----------------------------------------------------------------------------
 -- | Term equalities
