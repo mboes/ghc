@@ -90,7 +90,7 @@ data PmPat p = PmCon { pm_con_con     :: DataCon
                      , pm_con_dicts   :: [EvVar] -- Ditto *coercion variables* and *dictionaries*
                      , pm_con_args    :: [p] }
              | PmVar { pm_var_id      :: Id }
-             | PmLit { pm_lit_lit     :: PmLit } -- See NOTE [Literals in PmPat]
+             | PmLit { pm_lit_lit     :: HsLit } -- See NOTE [Literals in PmPat]
 
 data Pattern = PmGuard PatVec PmExpr      -- Guard Patterns
              | NonGuard (PmPat Pattern)   -- Other Patterns
@@ -214,13 +214,20 @@ mkListPatVec ty xs ys = [NonGuard $ PmCon { pm_con_con = consDataCon
                                           , pm_con_args = xs++ys }]
 
 mkLitPattern :: HsLit -> Pattern
-mkLitPattern lit = NonGuard $ PmLit { pm_lit_lit = PmSLit lit }
+mkLitPattern lit = NonGuard $ PmLit { pm_lit_lit = lit }
 
-mkPosLitPattern :: HsOverLit Id -> Pattern
-mkPosLitPattern lit = NonGuard $ PmLit { pm_lit_lit = PmOLit False lit }
+mkOLitGuard :: Id -> Maybe (SyntaxExpr Id) -> HsOverLit Id -> Pattern
+mkOLitGuard var mb_negate olit = PmGuard [truePattern] (PmExprEq (PmExprVar var) e)
+  where b = case mb_negate of
+              Just _  -> True
+              Nothing -> False
+        e = PmExprLit (PmOLit b olit)
 
-mkNegLitPattern :: HsOverLit Id -> Pattern
-mkNegLitPattern lit = NonGuard $ PmLit { pm_lit_lit = PmOLit True lit }
+-- mkPosLitPattern :: HsOverLit Id -> Pattern
+-- mkPosLitPattern lit = NonGuard $ PmLit { pm_lit_lit = PmOLit False lit }
+-- 
+-- mkNegLitPattern :: HsOverLit Id -> Pattern
+-- mkNegLitPattern lit = NonGuard $ PmLit { pm_lit_lit = PmOLit True lit }
 
 -- Specifically for overloaded strings. If we know that an overloaded x is a
 -- string, we can remove the fromString function since we know that it is the
@@ -313,9 +320,12 @@ translatePat pat = case pat of
                               , pm_con_args    = args }]
 
   NPat lit mb_neg _eq
-    | Just hs_lit <- oStrToHsLit_mb lit -> translatePat (LitPat hs_lit) -- overloaded string
-    | Just _  <- mb_neg -> return [mkNegLitPattern lit] -- negated literal
-    | Nothing <- mb_neg -> return [mkPosLitPattern lit] -- non-negated literal
+    | Just hs_lit <- oStrToHsLit_mb lit ->
+        translatePat (LitPat hs_lit) -- overloaded string
+    | otherwise -> do
+        var <- mkPmIdM (hsPatType pat)
+        let guard = mkOLitGuard var mb_neg lit
+        return [NonGuard (PmVar var), guard] -- don't like it. make a function for this sort of thing
 
   LitPat lit
       -- If it is a string then convert it to a list of characters
@@ -532,7 +542,7 @@ pmPatType :: PmPat p -> Type
 pmPatType (PmCon { pm_con_con = con, pm_con_arg_tys = tys })
                                      = mkTyConApp (dataConTyCon con) tys
 pmPatType (PmVar { pm_var_id  = x }) = idType x
-pmPatType (PmLit { pm_lit_lit = l }) = pmLitType l
+pmPatType (PmLit { pm_lit_lit = l }) = pmLitType (PmSLit l)
 
 mkOneConFull :: Id -> UniqSupply -> DataCon -> (PmPat ValAbs, [PmConstraint])
 --  *  x :: T tys, where T is an algebraic data type
@@ -671,6 +681,9 @@ mkPmId usupply ty = mkLocalId name ty
     occname = mkVarOccFS (fsLit (show unique))
     name    = mkInternalName unique occname noSrcSpan
 
+mkPmIdM :: Type -> UniqSM Id
+mkPmIdM ty = flip mkPmId ty <$> getUniqueSupplyM
+
 mkPmId2FormsSM :: Type -> UniqSM (Pattern, LHsExpr Id)
 mkPmId2FormsSM ty = do
   us <- getUniqueSupplyM
@@ -680,6 +693,9 @@ mkPmId2FormsSM ty = do
 -- ----------------------------------------------------------------------------
 -- | Converting between Value Abstractions, Patterns and PmExpr
 
+hsLitToPmExpr :: HsLit -> PmExpr
+hsLitToPmExpr lit = PmExprLit (PmSLit lit)
+
 valAbsToPmExpr :: ValAbs -> PmExpr
 valAbsToPmExpr (VA va) = pmPatToPmExpr va
 
@@ -687,7 +703,7 @@ pmPatToPmExpr :: PmPat ValAbs -> PmExpr
 pmPatToPmExpr (PmCon { pm_con_con  = c
                      , pm_con_args = ps }) = PmExprCon c (map valAbsToPmExpr ps)
 pmPatToPmExpr (PmVar { pm_var_id   = x  }) = PmExprVar x
-pmPatToPmExpr (PmLit { pm_lit_lit  = l  }) = PmExprLit l
+pmPatToPmExpr (PmLit { pm_lit_lit  = l  }) = PmExprLit (PmSLit l)
 
 -- Convert a pattern vector to a value list abstraction by dropping the guards
 -- recursively (See NOTE [Translating As Patterns])
@@ -979,22 +995,22 @@ cMatcher us gvsa (PmVar x) ps va vsa
   where cs = [TmConstraint x (pmPatToPmExpr va)]
 
 -- CLitCon
-cMatcher us gvsa (PmLit l) ps (va@(PmCon {})) vsa
+cMatcher us gvsa (PmLit l) ps (va@(PmCon {})) vsa -- THIS ACTUALLY CANNOT HAPPEN. IT SHOULD BE OVERLOADED
   = VA va `mkCons` (cs `mkConstraint` covered us2 gvsa ps vsa)
   where
     (us1, us2) = splitUniqSupply us
     y  = mkPmId us1 (pmPatType va)
-    cs = [ TmConstraint y (PmExprLit l)
+    cs = [ TmConstraint y (hsLitToPmExpr l)
          , TmConstraint y (pmPatToPmExpr va) ]
 
 -- | CConLit | --
-cMatcher us gvsa (p@(PmCon {})) ps (PmLit l) vsa
+cMatcher us gvsa (p@(PmCon {})) ps (PmLit l) vsa -- THIS ACTUALLY CANNOT HAPPEN
   = cMatcher us3 gvsa p ps con_abs (mkConstraint cs vsa)
   where
     (us1, us2, us3)   = splitUniqSupply3 us
     y                 = mkPmId us1 (pmPatType p)
     (con_abs, all_cs) = mkOneConFull y us2 (pm_con_con p)
-    cs = TmConstraint y (PmExprLit l) : all_cs
+    cs = TmConstraint y (hsLitToPmExpr l) : all_cs
 
 -- CConCon
 cMatcher us gvsa (p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
@@ -1006,10 +1022,9 @@ cMatcher us gvsa (p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
                          (covered us gvsa (args1 ++ ps) (foldr mkCons vsa args2))
 
 -- CLitLit
-cMatcher us gvsa (PmLit l1) ps (va@(PmLit l2)) vsa = case eqPmLit l1 l2 of
-  Just True  -> VA va `mkCons` covered us gvsa ps vsa -- we know: match
-  Just False -> Empty                                 -- we know: no match
-  Nothing    -> VA va `mkCons` covered us gvsa ps vsa -- Don't even try putting a constraint in the bag, it won't reduce.
+cMatcher us gvsa (PmLit l1) ps (va@(PmLit l2)) vsa
+  | l1 == l2  = VA va `mkCons` covered us gvsa ps vsa
+  | otherwise = Empty
 
 -- CConVar
 cMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa
@@ -1023,7 +1038,7 @@ cMatcher us gvsa (p@(PmLit l)) ps (PmVar x) vsa
   = cMatcher us gvsa p ps lit_abs (mkConstraint cs vsa)
   where
     lit_abs = PmLit l
-    cs      = [TmConstraint x (PmExprLit l)]
+    cs      = [TmConstraint x (hsLitToPmExpr l)]
 
 -- | uMatcher
 -- ----------------------------------------------------------------------------
@@ -1034,20 +1049,20 @@ uMatcher us gvsa (PmVar x) ps va vsa
   where cs = [TmConstraint x (pmPatToPmExpr va)]
 
 -- ULitCon
-uMatcher us gvsa (PmLit l) ps (va@(PmCon {})) vsa
+uMatcher us gvsa (PmLit l) ps (va@(PmCon {})) vsa -- THIS ACTUALLY CANNOT HAPPEN
   = uMatcher us2 gvsa (PmVar y) ps va (mkConstraint cs vsa)
   where
     (us1, us2) = splitUniqSupply us
     y  = mkPmId us1 (pmPatType va)
-    cs = [TmConstraint y (PmExprLit l)]
+    cs = [TmConstraint y (hsLitToPmExpr l)]
 
 -- | UConLit | --
-uMatcher us gvsa (p@(PmCon {})) ps (PmLit l) vsa
+uMatcher us gvsa (p@(PmCon {})) ps (PmLit l) vsa -- THIS CANNOT HAPPEN
   = uMatcher us2 gvsa p ps (PmVar y) (mkConstraint cs vsa)
   where
     (us1, us2) = splitUniqSupply us
     y  = mkPmId us1 (pmPatType p)
-    cs = [TmConstraint y (PmExprLit l)]
+    cs = [TmConstraint y (hsLitToPmExpr l)]
 
 -- UConCon
 uMatcher us gvsa ( p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
@@ -1059,10 +1074,9 @@ uMatcher us gvsa ( p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
                          (uncovered us gvsa (args1 ++ ps) (foldr mkCons vsa args2))
 
 -- ULitLit
-uMatcher us gvsa (PmLit l1) ps (va@(PmLit l2)) vsa = case eqPmLit l1 l2 of
-  Just True  -> VA va `mkCons` uncovered us gvsa ps vsa -- we know: match
-  Just False -> VA va `mkCons` vsa                      -- we know: no match
-  Nothing    -> VA va `mkCons` vsa                      -- no clue: assume the worst?
+uMatcher us gvsa (PmLit l1) ps (va@(PmLit l2)) vsa
+  | l1 == l2  = VA va `mkCons` uncovered us gvsa ps vsa
+  | otherwise = VA va `mkCons` vsa
 
 -- UConVar
 uMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa
@@ -1083,9 +1097,9 @@ uMatcher us gvsa (p@(PmLit l)) ps (PmVar x) vsa
   where
     (us1, us2) = splitUniqSupply us
     y  = mkPmId us1 (pmPatType p)
-    match_cs     = [ TmConstraint x (PmExprLit l)]
+    match_cs     = [ TmConstraint x (hsLitToPmExpr l)]
     non_match_cs = [ TmConstraint y falsePmExpr
-                   , TmConstraint y (PmExprEq (PmExprVar x) (PmExprLit l)) ]
+                   , TmConstraint y (PmExprEq (PmExprVar x) (hsLitToPmExpr l)) ]
 
 -- | dMatcher
 -- ----------------------------------------------------------------------------
@@ -1096,23 +1110,23 @@ dMatcher us gvsa (PmVar x) ps va vsa
   where cs = [TmConstraint x (pmPatToPmExpr va)]
 
 -- DLitCon
-dMatcher us gvsa (PmLit l) ps (va@(PmCon {})) vsa
+dMatcher us gvsa (PmLit l) ps (va@(PmCon {})) vsa -- THIS CANNOT HAPPEN
   = VA va  `mkCons` (cs `mkConstraint` divergent us2 gvsa ps vsa)
   where
     (us1, us2) = splitUniqSupply us
     y  = mkPmId us1 (pmPatType va)
-    cs = [ TmConstraint y (PmExprLit l)
+    cs = [ TmConstraint y (hsLitToPmExpr l)
          , TmConstraint y (pmPatToPmExpr va) ]
 
 -- DConLit
 -- IT WILL LOOK LIKE FORCED AT FIRST BUT I HOPE THE SOLVER FIXES THIS
-dMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmLit l) vsa
+dMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmLit l) vsa -- THIS CANNOT HAPPEN
   = dMatcher us3 gvsa p ps con_abs (mkConstraint cs vsa)
   where
     (us1, us2, us3)   = splitUniqSupply3 us
     y                 = mkPmId us1 (pmPatType p)
     (con_abs, all_cs) = mkOneConFull y us2 con
-    cs = TmConstraint y (PmExprLit l) : all_cs
+    cs = TmConstraint y (hsLitToPmExpr l) : all_cs
 
 -- DConCon
 dMatcher us gvsa (p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
@@ -1124,10 +1138,9 @@ dMatcher us gvsa (p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
                          (divergent us gvsa (args1 ++ ps) (foldr mkCons vsa args2))
 
 -- DLitLit
-dMatcher us gvsa (PmLit l1) ps (va@(PmLit l2)) vsa = case eqPmLit l1 l2 of
-  Just True  -> VA va `mkCons` divergent us gvsa ps vsa -- we know: match
-  Just False -> Empty                                   -- we know: no match
-  Nothing    -> VA va `mkCons` divergent us gvsa ps vsa -- Don't even try putting a constraint in the bag, it won't reduce.
+dMatcher us gvsa (PmLit l1) ps (va@(PmLit l2)) vsa
+  | l1 == l2  = VA va `mkCons` divergent us gvsa ps vsa
+  | otherwise = Empty
 
 -- DConVar
 dMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa
@@ -1142,7 +1155,7 @@ dMatcher us gvsa (PmLit l) ps (PmVar x) vsa
   = mkUnion (VA (PmVar x) `mkCons` mkConstraint [BtConstraint x] vsa)
             (dMatcher us gvsa (PmLit l) ps (PmLit l) (mkConstraint cs vsa))
   where
-    cs = [TmConstraint x (PmExprLit l)]
+    cs = [TmConstraint x (hsLitToPmExpr l)]
 
 {-
 %************************************************************************
