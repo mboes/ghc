@@ -845,20 +845,20 @@ isNotEmpty _vsa  = True
 
 -- we need to decouple this from the tc. for now let's redo it
 prunePure :: ValSetAbs -> ValSetAbs
-prunePure = prunePureVSA ([], initialTmState, Nothing)
+prunePure = prunePureVSA (initialTmState, Nothing)
   where
-    prunePureVSA :: ([EvVar], TmState, Maybe Id) -> ValSetAbs -> ValSetAbs
-    prunePureVSA all_cs@(ty_cs, tm_env, bot_ct) in_vsa = case in_vsa of
+    prunePureVSA :: (TmState, Maybe Id) -> ValSetAbs -> ValSetAbs
+    prunePureVSA all_cs@(tm_env, bot_ct) in_vsa = case in_vsa of
       Empty             -> Empty
       Union vsa1 vsa2   -> prunePureVSA all_cs vsa1 `mkUnion` prunePureVSA all_cs vsa2
       Singleton         -> Singleton
       Cons va vsa       -> va `mkCons` prunePureVSA all_cs vsa
       Constraint cs vsa -> case splitConstraints cs of
-        (new_ty_cs, new_tm_cs, new_bot_ct) -> case tmOracle tm_env new_tm_cs of
+        (ty_cs, new_tm_cs, new_bot_ct) -> case tmOracle tm_env new_tm_cs of
           Just (new_tm_env@(residual, (expr_eqs, subst))) ->
             let bot = mergeBotCs new_bot_ct bot_ct
                 ans = isNothing bot || notNull residual || expr_eqs || notForced (fromJust bot) subst
-            in  if ans then prunePureVSA (new_ty_cs++ty_cs, new_tm_env, bot) vsa
+            in  if ans then cs `mkConstraint` prunePureVSA (new_tm_env, bot) vsa
                        else Empty
           Nothing -> Empty
 
