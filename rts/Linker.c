@@ -5178,6 +5178,8 @@ ocRunInit_PEi386 ( ObjectCode *oc )
 #  define ELF_64BIT
 #elif aarch64_HOST_ARCH
 #  define ELF_64BIT
+#elif (arm_HOST_ARCH || arm_HOST_ARCH_PRE_ARMv7 || arm_HOST_ARCH_PRE_ARMv7 || powerpc_HOST_ARCH)
+   /* Nothing here */
 #else
 # error "Unknown HOST_ARCH"
 #endif
