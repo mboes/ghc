@@ -5178,9 +5178,11 @@ ocRunInit_PEi386 ( ObjectCode *oc )
 #  define ELF_64BIT
 #elif aarch64_HOST_ARCH
 #  define ELF_64BIT
-#elif (arm_HOST_ARCH || arm_HOST_ARCH_PRE_ARMv7 || arm_HOST_ARCH_PRE_ARMv7 || powerpc_HOST_ARCH)
+#elif (arm_HOST_ARCH || arm_HOST_ARCH_PRE_ARMv7 || arm_HOST_ARCH_PRE_ARMv7 \
+		|| powerpc_HOST_ARCH)
    /* Nothing here */
 #else
+	/* Need this so that new architectures get a compile error. */
 # error "Unknown HOST_ARCH"
 #endif
 
@@ -5399,8 +5401,6 @@ ocVerifyImage_ELF ( ObjectCode* oc )
    char*     ehdrC = (char*)(oc->image);
    Elf_Ehdr* ehdr  = (Elf_Ehdr*)ehdrC;
 
-printf ("%s %d:\n", __func__, __LINE__) ;
-
    if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
        ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
        ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
@@ -5409,11 +5409,7 @@ printf ("%s %d:\n", __func__, __LINE__) ;
       return 0;
    }
 
-printf ("%s %d:\n", __func__, __LINE__) ;
-
    if (ehdr->e_ident[EI_CLASS] != ELFCLASS) {
-printf ("%s %d: ehdr->e_ident[EI_CLASS] %u     ELFCLASS %u\n", __func__, __LINE__, ehdr->e_ident[EI_CLASS], ELFCLASS) ;
-
       errorBelch("%s: unsupported ELF format", oc->fileName);
       return 0;
    }
@@ -5453,6 +5449,10 @@ printf ("%s %d: ehdr->e_ident[EI_CLASS] %u     ELFCLASS %u\n", __func__, __LINE_
 #elif defined(EM_AMD64)
       case EM_AMD64: IF_DEBUG(linker,debugBelch( "amd64" )); break;
 #endif
+#ifdef EM_AARCH64
+      case EM_AARCH64: IF_DEBUG(linker,debugBelch( "aarch64" )); break;
+#endif
+
       default:       IF_DEBUG(linker,debugBelch( "unknown" ));
                      errorBelch("%s: unknown architecture (e_machine == %d)"
                                 , oc->fileName, ehdr->e_machine);
