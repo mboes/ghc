@@ -90,7 +90,6 @@ data PmPat p = PmCon { pm_con_con     :: DataCon
                      , pm_con_dicts   :: [EvVar] -- Ditto *coercion variables* and *dictionaries*
                      , pm_con_args    :: [p] }
              | PmVar { pm_var_id      :: Id }
-             | PmLit { pm_lit_lit     :: HsLit } -- See NOTE [Literals in PmPat]
 
 data Pattern = PmGuard PatVec PmExpr      -- Guard Patterns
              | NonGuard (PmPat Pattern)   -- Other Patterns
@@ -213,8 +212,9 @@ mkListPatVec ty xs ys = [NonGuard $ PmCon { pm_con_con = consDataCon
                                           , pm_con_tvs = [], pm_con_dicts = []
                                           , pm_con_args = xs++ys }]
 
-mkLitPattern :: HsLit -> Pattern
-mkLitPattern lit = NonGuard $ PmLit { pm_lit_lit = lit }
+mkSLitGuard :: Id -> HsLit -> Pattern
+mkSLitGuard var lit = PmGuard [truePattern] (PmExprEq (PmExprVar var) e)
+  where e = PmExprLit (PmSLit lit)
 
 mkOLitGuard :: Id -> Maybe (SyntaxExpr Id) -> HsOverLit Id -> Pattern
 mkOLitGuard var mb_negate olit = PmGuard [truePattern] (PmExprEq (PmExprVar var) e)
@@ -222,12 +222,6 @@ mkOLitGuard var mb_negate olit = PmGuard [truePattern] (PmExprEq (PmExprVar var)
               Just _  -> True
               Nothing -> False
         e = PmExprLit (PmOLit b olit)
-
--- mkPosLitPattern :: HsOverLit Id -> Pattern
--- mkPosLitPattern lit = NonGuard $ PmLit { pm_lit_lit = PmOLit False lit }
--- 
--- mkNegLitPattern :: HsOverLit Id -> Pattern
--- mkNegLitPattern lit = NonGuard $ PmLit { pm_lit_lit = PmOLit True lit }
 
 -- Specifically for overloaded strings. If we know that an overloaded x is a
 -- string, we can remove the fromString function since we know that it is the
@@ -332,7 +326,10 @@ translatePat pat = case pat of
     | HsString src s <- lit ->
         foldr (mkListPatVec charTy) [nilPattern charTy] <$>
           translatePatVec (map (LitPat . HsChar src) (unpackFS s))
-    | otherwise -> return [mkLitPattern lit]
+    | otherwise -> do
+        var <- mkPmIdM (hsPatType pat)
+        let guard = mkSLitGuard var lit
+        return [NonGuard (PmVar var), guard]
 
   PArrPat ps ty -> do
     tidy_ps <- translatePatVec (map unLoc ps)
@@ -542,7 +539,6 @@ pmPatType :: PmPat p -> Type
 pmPatType (PmCon { pm_con_con = con, pm_con_arg_tys = tys })
                                      = mkTyConApp (dataConTyCon con) tys
 pmPatType (PmVar { pm_var_id  = x }) = idType x
-pmPatType (PmLit { pm_lit_lit = l }) = pmLitType (PmSLit l)
 
 mkOneConFull :: Id -> UniqSupply -> DataCon -> (PmPat ValAbs, [PmConstraint])
 --  *  x :: T tys, where T is an algebraic data type
@@ -703,7 +699,6 @@ pmPatToPmExpr :: PmPat ValAbs -> PmExpr
 pmPatToPmExpr (PmCon { pm_con_con  = c
                      , pm_con_args = ps }) = PmExprCon c (map valAbsToPmExpr ps)
 pmPatToPmExpr (PmVar { pm_var_id   = x  }) = PmExprVar x
-pmPatToPmExpr (PmLit { pm_lit_lit  = l  }) = PmExprLit (PmSLit l)
 
 -- Convert a pattern vector to a value list abstraction by dropping the guards
 -- recursively (See NOTE [Translating As Patterns])
@@ -712,7 +707,6 @@ coercePatVec pv = [ VA (coercePmPat p) | NonGuard p <- pv]
 
 coercePmPat :: PmPat Pattern -> PmPat ValAbs
 coercePmPat (PmVar { pm_var_id  = x }) = PmVar { pm_var_id  = x }
-coercePmPat (PmLit { pm_lit_lit = l }) = PmLit { pm_lit_lit = l }
 coercePmPat (PmCon { pm_con_con = con, pm_con_arg_tys = arg_tys
                    , pm_con_tvs = tvs, pm_con_dicts = dicts
                    , pm_con_args = args })
@@ -770,7 +764,7 @@ anySatValSetAbs vsa = isNotEmpty <$> pruneValSetAbsBound 1 vsa
 
 -- TAKE THE INT AS AN ARGUMENT
 pruneValSetAbs :: ValSetAbs -> PmM [(ValVecAbs,([ComplexEq], PmVarEnv))]
-pruneValSetAbs vsa = pruneValSetAbsBoundVec 4 vsa
+pruneValSetAbs vsa = pruneValSetAbsBoundVec 5 vsa
 
 pruneValSetAbsBound :: Int -> ValSetAbs -> PmM ValSetAbs
 pruneValSetAbsBound n v = fst <$> pruneValSetAbsBound' n init_cs v
@@ -848,6 +842,25 @@ pruneValSetAbsBoundVec n v = fst <$> pruneValSetAbsBoundVec' n init_cs emptylist
 isNotEmpty :: ValSetAbs -> Bool
 isNotEmpty Empty = False
 isNotEmpty _vsa  = True
+
+-- we need to decouple this from the tc. for now let's redo it
+prunePure :: ValSetAbs -> ValSetAbs
+prunePure = prunePureVSA ([], initialTmState, Nothing)
+  where
+    prunePureVSA :: ([EvVar], TmState, Maybe Id) -> ValSetAbs -> ValSetAbs
+    prunePureVSA all_cs@(ty_cs, tm_env, bot_ct) in_vsa = case in_vsa of
+      Empty             -> Empty
+      Union vsa1 vsa2   -> prunePureVSA all_cs vsa1 `mkUnion` prunePureVSA all_cs vsa2
+      Singleton         -> Singleton
+      Cons va vsa       -> va `mkCons` prunePureVSA all_cs vsa
+      Constraint cs vsa -> case splitConstraints cs of
+        (new_ty_cs, new_tm_cs, new_bot_ct) -> case tmOracle tm_env new_tm_cs of
+          Just (new_tm_env@(residual, (expr_eqs, subst))) ->
+            let bot = mergeBotCs new_bot_ct bot_ct
+                ans = isNothing bot || notNull residual || expr_eqs || notForced (fromJust bot) subst
+            in  if ans then prunePureVSA (new_ty_cs++ty_cs, new_tm_env, bot) vsa
+                       else Empty
+          Nothing -> Empty
 
 -- ----------------------------------------------------------------------------
 -- ----------------------------------------------------------------------------
@@ -927,9 +940,9 @@ patVectProc (vec,gvs) vsa = do
   us <- getUniqueSupplyM
   let (c_def, u_def, d_def) = process_guards us gvs -- default (the continuation)
   (usC, usU, usD) <- getUniqueSupplyM3
-  mb_c <- anySatValSetAbs (covered   usC c_def vec vsa)
-  mb_d <- anySatValSetAbs (divergent usD d_def vec vsa)
-  let vsa' = uncovered usU u_def vec vsa
+  mb_c <- anySatValSetAbs $ prunePure (covered   usC c_def vec vsa)
+  mb_d <- anySatValSetAbs $ prunePure (divergent usD d_def vec vsa)
+  let vsa' = prunePure $ uncovered usU u_def vec vsa
   return (mb_c, mb_d, vsa')
 
 -- | Covered, Uncovered, Divergent
@@ -994,24 +1007,6 @@ cMatcher us gvsa (PmVar x) ps va vsa
   = VA va `mkCons` (cs `mkConstraint` covered us gvsa ps vsa)
   where cs = [TmConstraint x (pmPatToPmExpr va)]
 
--- CLitCon
-cMatcher us gvsa (PmLit l) ps (va@(PmCon {})) vsa -- THIS ACTUALLY CANNOT HAPPEN. IT SHOULD BE OVERLOADED
-  = VA va `mkCons` (cs `mkConstraint` covered us2 gvsa ps vsa)
-  where
-    (us1, us2) = splitUniqSupply us
-    y  = mkPmId us1 (pmPatType va)
-    cs = [ TmConstraint y (hsLitToPmExpr l)
-         , TmConstraint y (pmPatToPmExpr va) ]
-
--- | CConLit | --
-cMatcher us gvsa (p@(PmCon {})) ps (PmLit l) vsa -- THIS ACTUALLY CANNOT HAPPEN
-  = cMatcher us3 gvsa p ps con_abs (mkConstraint cs vsa)
-  where
-    (us1, us2, us3)   = splitUniqSupply3 us
-    y                 = mkPmId us1 (pmPatType p)
-    (con_abs, all_cs) = mkOneConFull y us2 (pm_con_con p)
-    cs = TmConstraint y (hsLitToPmExpr l) : all_cs
-
 -- CConCon
 cMatcher us gvsa (p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
                     (PmCon { pm_con_con = c2, pm_con_args = args2 }) vsa
@@ -1021,24 +1016,12 @@ cMatcher us gvsa (p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
                          (pm_con_dicts   p)
                          (covered us gvsa (args1 ++ ps) (foldr mkCons vsa args2))
 
--- CLitLit
-cMatcher us gvsa (PmLit l1) ps (va@(PmLit l2)) vsa
-  | l1 == l2  = VA va `mkCons` covered us gvsa ps vsa
-  | otherwise = Empty
-
 -- CConVar
 cMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa
   = cMatcher us2 gvsa p ps con_abs (mkConstraint all_cs vsa)
   where
     (us1, us2)        = splitUniqSupply us
     (con_abs, all_cs) = mkOneConFull x us1 con
-
--- | CLitVar | --
-cMatcher us gvsa (p@(PmLit l)) ps (PmVar x) vsa
-  = cMatcher us gvsa p ps lit_abs (mkConstraint cs vsa)
-  where
-    lit_abs = PmLit l
-    cs      = [TmConstraint x (hsLitToPmExpr l)]
 
 -- | uMatcher
 -- ----------------------------------------------------------------------------
@@ -1048,22 +1031,6 @@ uMatcher us gvsa (PmVar x) ps va vsa
   = VA va `mkCons` (cs `mkConstraint` uncovered us gvsa ps vsa)
   where cs = [TmConstraint x (pmPatToPmExpr va)]
 
--- ULitCon
-uMatcher us gvsa (PmLit l) ps (va@(PmCon {})) vsa -- THIS ACTUALLY CANNOT HAPPEN
-  = uMatcher us2 gvsa (PmVar y) ps va (mkConstraint cs vsa)
-  where
-    (us1, us2) = splitUniqSupply us
-    y  = mkPmId us1 (pmPatType va)
-    cs = [TmConstraint y (hsLitToPmExpr l)]
-
--- | UConLit | --
-uMatcher us gvsa (p@(PmCon {})) ps (PmLit l) vsa -- THIS CANNOT HAPPEN
-  = uMatcher us2 gvsa p ps (PmVar y) (mkConstraint cs vsa)
-  where
-    (us1, us2) = splitUniqSupply us
-    y  = mkPmId us1 (pmPatType p)
-    cs = [TmConstraint y (hsLitToPmExpr l)]
-
 -- UConCon
 uMatcher us gvsa ( p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
                  (va@(PmCon { pm_con_con = c2, pm_con_args = args2 })) vsa
@@ -1072,11 +1039,6 @@ uMatcher us gvsa ( p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
                          (pm_con_tvs     p)
                          (pm_con_dicts   p)
                          (uncovered us gvsa (args1 ++ ps) (foldr mkCons vsa args2))
-
--- ULitLit
-uMatcher us gvsa (PmLit l1) ps (va@(PmLit l2)) vsa
-  | l1 == l2  = VA va `mkCons` uncovered us gvsa ps vsa
-  | otherwise = VA va `mkCons` vsa
 
 -- UConVar
 uMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa
@@ -1090,17 +1052,6 @@ uMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa
     add_one (va,cs) valset = valset `mkUnion` (VA va `mkCons` (cs `mkConstraint` vsa))
     inst_vsa   = foldr add_one Empty cons_cs
 
--- ULitVar
-uMatcher us gvsa (p@(PmLit l)) ps (PmVar x) vsa
-  = mkUnion (uMatcher us2 gvsa p ps (PmLit l) (mkConstraint match_cs vsa)) -- matching case
-            (non_match_cs `mkConstraint` (VA (PmVar x) `mkCons` vsa))      -- non-matching case
-  where
-    (us1, us2) = splitUniqSupply us
-    y  = mkPmId us1 (pmPatType p)
-    match_cs     = [ TmConstraint x (hsLitToPmExpr l)]
-    non_match_cs = [ TmConstraint y falsePmExpr
-                   , TmConstraint y (PmExprEq (PmExprVar x) (hsLitToPmExpr l)) ]
-
 -- | dMatcher
 -- ----------------------------------------------------------------------------
 
@@ -1108,25 +1059,6 @@ uMatcher us gvsa (p@(PmLit l)) ps (PmVar x) vsa
 dMatcher us gvsa (PmVar x) ps va vsa
   = VA va `mkCons` (cs `mkConstraint` divergent us gvsa ps vsa)
   where cs = [TmConstraint x (pmPatToPmExpr va)]
-
--- DLitCon
-dMatcher us gvsa (PmLit l) ps (va@(PmCon {})) vsa -- THIS CANNOT HAPPEN
-  = VA va  `mkCons` (cs `mkConstraint` divergent us2 gvsa ps vsa)
-  where
-    (us1, us2) = splitUniqSupply us
-    y  = mkPmId us1 (pmPatType va)
-    cs = [ TmConstraint y (hsLitToPmExpr l)
-         , TmConstraint y (pmPatToPmExpr va) ]
-
--- DConLit
--- IT WILL LOOK LIKE FORCED AT FIRST BUT I HOPE THE SOLVER FIXES THIS
-dMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmLit l) vsa -- THIS CANNOT HAPPEN
-  = dMatcher us3 gvsa p ps con_abs (mkConstraint cs vsa)
-  where
-    (us1, us2, us3)   = splitUniqSupply3 us
-    y                 = mkPmId us1 (pmPatType p)
-    (con_abs, all_cs) = mkOneConFull y us2 con
-    cs = TmConstraint y (hsLitToPmExpr l) : all_cs
 
 -- DConCon
 dMatcher us gvsa (p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
@@ -1137,11 +1069,6 @@ dMatcher us gvsa (p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
                          (pm_con_dicts   p)
                          (divergent us gvsa (args1 ++ ps) (foldr mkCons vsa args2))
 
--- DLitLit
-dMatcher us gvsa (PmLit l1) ps (va@(PmLit l2)) vsa
-  | l1 == l2  = VA va `mkCons` divergent us gvsa ps vsa
-  | otherwise = Empty
-
 -- DConVar
 dMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa
   = mkUnion (VA (PmVar x) `mkCons` mkConstraint [BtConstraint x] vsa)
@@ -1149,13 +1076,6 @@ dMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa
   where
     (us1, us2)        = splitUniqSupply us
     (con_abs, all_cs) = mkOneConFull x us1 con
-
--- DLitVar
-dMatcher us gvsa (PmLit l) ps (PmVar x) vsa
-  = mkUnion (VA (PmVar x) `mkCons` mkConstraint [BtConstraint x] vsa)
-            (dMatcher us gvsa (PmLit l) ps (PmLit l) (mkConstraint cs vsa))
-  where
-    cs = [TmConstraint x (hsLitToPmExpr l)]
 
 {-
 %************************************************************************
