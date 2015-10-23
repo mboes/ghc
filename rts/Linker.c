@@ -6206,7 +6206,7 @@ do_Elf_Rela_relocations ( ObjectCode* oc, char* ehdrC,
    int symtab_shndx = shdr[shnum].sh_link;
    int strtab_shndx = shdr[symtab_shndx].sh_link;
    int target_shndx = shdr[shnum].sh_info;
-#if defined(DEBUG) || defined(sparc_HOST_ARCH) || defined(ia64_HOST_ARCH) || defined(powerpc_HOST_ARCH) || defined(x86_64_HOST_ARCH)
+#if defined(DEBUG) || defined(sparc_HOST_ARCH) || defined(ia64_HOST_ARCH) || defined(powerpc_HOST_ARCH) || defined(x86_64_HOST_ARCH) || defined(aarch64_HOST_ARCH)
    /* This #ifdef only serves to avoid unused-var warnings. */
    Elf_Addr targ = (Elf_Addr) oc->sections[target_shndx].start;
 #endif
@@ -6224,7 +6224,7 @@ do_Elf_Rela_relocations ( ObjectCode* oc, char* ehdrC,
    }
 
    for (j = 0; j < nent; j++) {
-#if defined(DEBUG) || defined(sparc_HOST_ARCH) || defined(ia64_HOST_ARCH) || defined(powerpc_HOST_ARCH) || defined(x86_64_HOST_ARCH)
+#if defined(DEBUG) || defined(sparc_HOST_ARCH) || defined(ia64_HOST_ARCH) || defined(powerpc_HOST_ARCH) || defined(x86_64_HOST_ARCH) || defined(aarch64_HOST_ARCH)
       /* This #ifdef only serves to avoid unused-var warnings. */
       Elf_Addr  offset = rtab[j].r_offset;
       Elf_Addr  P      = targ + offset;
@@ -6515,6 +6515,16 @@ do_Elf_Rela_relocations ( ObjectCode* oc, char* ehdrC,
           break;
       }
 #endif
+
+	case R_AARCH64_ABS64:
+          puts ("R_AARCH64_ABS64");
+          *(Elf64_Xword *)P = S + A;
+          break;
+
+	case R_AARCH64_ADR_PREL_PG_HI21:
+            puts ("AArch64: unhandled ELF relocation(RelA) R_AARCH64_ADR_PREL_PG_HI21");
+            break;
+
 
          default:
             errorBelch("%s: unhandled ELF relocation(RelA) type %" FMT_Word "\n",
