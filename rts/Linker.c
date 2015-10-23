@@ -6522,8 +6522,22 @@ do_Elf_Rela_relocations ( ObjectCode* oc, char* ehdrC,
           break;
 
 	case R_AARCH64_ADR_PREL_PG_HI21:
-            puts ("AArch64: unhandled ELF relocation(RelA) R_AARCH64_ADR_PREL_PG_HI21");
-            break;
+          puts ("AArch64: unhandled ELF relocation(RelA) R_AARCH64_ADR_PREL_PG_HI21");
+		  {
+            // Operation: Page(S+A) - Page(P)
+            uint64_t Result = ((S + A) & ~0xfffULL) - (FinalAddress & ~0xfffULL);
+
+            // Check that -2^32 <= X < 2^32
+            if (Result >> 32)
+                 barf ("%s: overflow check failed for relocation", oc->fileName);
+
+            *(Elf64_Xword *)P &= 0x9f00001fU;
+            // Immediate goes in bits 30:29 + 5:23 of ADRP instruction, taken
+            // from bits 32:12 of X.
+            *(Elf64_Xword *)P |= ((Result & 0x3000U) << (29 - 12));
+            *(Elf64_Xword *)P |= ((Result & 0x1ffffc000ULL) >> (14 - 5));
+          }
+          break;
 
 
          default:
