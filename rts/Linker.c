@@ -2233,9 +2233,10 @@ static StgWord getPageSize(void)
 {
     static StgWord pagesize = 0;
     if (pagesize == 0) {
-        pagesize = sysconf(_SC_PAGESIZE);
+        return sysconf(_SC_PAGESIZE);
+    } else {
+        return pagesize;
     }
-    return pagesize;
 }
 
 static StgWord roundUpToPage (StgWord size)
@@ -5165,16 +5166,20 @@ ocRunInit_PEi386 ( ObjectCode *oc )
 #define FALSE 0
 #define TRUE  1
 
-#if defined(sparc_HOST_ARCH)
+#if sparc_HOST_ARCH
 #  define ELF_TARGET_SPARC  /* Used inside <elf.h> */
-#elif defined(i386_HOST_ARCH)
+#elif i386_HOST_ARCH
 #  define ELF_TARGET_386    /* Used inside <elf.h> */
-#elif defined(x86_64_HOST_ARCH)
+#elif x86_64_HOST_ARCH
 #  define ELF_TARGET_X64_64
 #  define ELF_64BIT
 #  define ELF_TARGET_AMD64 /* Used inside <elf.h> on Solaris 11 */
-#elif defined(powerpc64_HOST_ARCH)
+#elif powerpc64_HOST_ARCH
 #  define ELF_64BIT
+#elif aarch64_HOST_ARCH
+#  define ELF_64BIT
+#else
+# error "Unknown HOST_ARCH"
 #endif
 
 #if !defined(openbsd_HOST_OS)
@@ -5392,6 +5397,8 @@ ocVerifyImage_ELF ( ObjectCode* oc )
    char*     ehdrC = (char*)(oc->image);
    Elf_Ehdr* ehdr  = (Elf_Ehdr*)ehdrC;
 
+printf ("%s %d:\n", __func__, __LINE__) ;
+
    if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
        ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
        ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
@@ -5400,7 +5407,11 @@ ocVerifyImage_ELF ( ObjectCode* oc )
       return 0;
    }
 
+printf ("%s %d:\n", __func__, __LINE__) ;
+
    if (ehdr->e_ident[EI_CLASS] != ELFCLASS) {
+printf ("%s %d: ehdr->e_ident[EI_CLASS] %u     ELFCLASS %u\n", __func__, __LINE__, ehdr->e_ident[EI_CLASS], ELFCLASS) ;
+
       errorBelch("%s: unsupported ELF format", oc->fileName);
       return 0;
    }
