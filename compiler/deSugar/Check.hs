@@ -843,24 +843,65 @@ isNotEmpty :: ValSetAbs -> Bool
 isNotEmpty Empty = False
 isNotEmpty _vsa  = True
 
+-- ----------------------------------------------------------------------------
+-- ----------------------------------------------------------------------------
+
 -- we need to decouple this from the tc. for now let's redo it
-prunePure :: ValSetAbs -> ValSetAbs
-prunePure = prunePureVSA (initialTmState, Nothing)
+pruneTm :: ValSetAbs -> ValSetAbs
+pruneTm = pruneTmVSA (initialTmState, Nothing)
   where
-    prunePureVSA :: (TmState, Maybe Id) -> ValSetAbs -> ValSetAbs
-    prunePureVSA all_cs@(tm_env, bot_ct) in_vsa = case in_vsa of
+    pruneTmVSA :: (TmState, Maybe Id) -> ValSetAbs -> ValSetAbs
+    pruneTmVSA all_cs@(tm_env, bot_ct) in_vsa = case in_vsa of
       Empty             -> Empty
-      Union vsa1 vsa2   -> prunePureVSA all_cs vsa1 `mkUnion` prunePureVSA all_cs vsa2
+      Union vsa1 vsa2   -> pruneTmVSA all_cs vsa1 `mkUnion` pruneTmVSA all_cs vsa2
       Singleton         -> Singleton
-      Cons va vsa       -> va `mkCons` prunePureVSA all_cs vsa
+      Cons va vsa       -> va `mkCons` pruneTmVSA all_cs vsa
       Constraint cs vsa -> case splitConstraints cs of
         (ty_cs, new_tm_cs, new_bot_ct) -> case tmOracle tm_env new_tm_cs of
           Just (new_tm_env@(residual, (expr_eqs, subst))) ->
             let bot = mergeBotCs new_bot_ct bot_ct
                 ans = isNothing bot || notNull residual || expr_eqs || notForced (fromJust bot) subst
-            in  if ans then cs `mkConstraint` prunePureVSA (new_tm_env, bot) vsa
+            in  if ans then cs `mkConstraint` pruneTmVSA (new_tm_env, bot) vsa
                        else Empty
           Nothing -> Empty
+
+-- -- ----------------------------------------------------------------------------
+
+pruneTy :: Int -> ValSetAbs -> PmM [(ValVecAbs,([ComplexEq], PmVarEnv))]
+pruneTy n v = pruneTy' n init_cs emptylist v
+  where
+    init_cs :: ([EvVar], TmState, Maybe Id)
+    init_cs = ([], initialTmState, Nothing)
+
+    pruneTy' :: Int -> ([EvVar], TmState, Maybe Id) -> DList ValAbs -> ValSetAbs -> PmM [(ValVecAbs,([ComplexEq], PmVarEnv))]
+    pruneTy' n all_cs@(ty_cs, tm_env, bot_ct) vec in_vsa
+      | n <= 0    = return [] -- no need to keep going
+      | otherwise = case in_vsa of
+          Empty -> return []
+          Union vsa1 vsa2 -> do
+            vecs1 <- pruneTy' n all_cs vec vsa1
+            vecs2 <- pruneTy' (n - length vecs1) all_cs vec vsa2
+            return (vecs1 ++ vecs2)
+          Singleton -> do
+            sat <- tyOracle (listToBag ty_cs) -- it would be nice to have this incremental too
+            return $ case sat of
+              True  -> [(toList vec, wrapUpTmState tm_env)]
+              False -> []
+          Constraint cs vsa -> case splitConstraints cs of -- undefined {- FIXME -}
+            (new_ty_cs, new_tm_cs, new_bot_ct) -> case tmOracle tm_env new_tm_cs of
+                Just (new_tm_env@(residual, (expr_eqs, subst))) ->
+                  let bot = mergeBotCs new_bot_ct bot_ct
+                      ans = isNothing bot || notNull residual || expr_eqs || notForced (fromJust bot) subst
+                  in  case ans of
+                        True  -> pruneTy' n (new_ty_cs++ty_cs, new_tm_env, bot) vec vsa
+                        False -> return []
+                Nothing -> return []
+          Cons va vsa -> pruneTy' n all_cs (vec `snoc` va) vsa
+
+-- -- ----------------------------------------------------------------------------
+
+
+
 
 -- ----------------------------------------------------------------------------
 -- ----------------------------------------------------------------------------
@@ -940,9 +981,9 @@ patVectProc (vec,gvs) vsa = do
   us <- getUniqueSupplyM
   let (c_def, u_def, d_def) = process_guards us gvs -- default (the continuation)
   (usC, usU, usD) <- getUniqueSupplyM3
-  mb_c <- anySatValSetAbs $ prunePure (covered   usC c_def vec vsa)
-  mb_d <- anySatValSetAbs $ prunePure (divergent usD d_def vec vsa)
-  let vsa' = prunePure $ uncovered usU u_def vec vsa
+  mb_c <- anySatValSetAbs $ pruneTm (covered   usC c_def vec vsa)
+  mb_d <- anySatValSetAbs $ pruneTm (divergent usD d_def vec vsa)
+  let vsa' = pruneTm $ uncovered usU u_def vec vsa
   return (mb_c, mb_d, vsa')
 
 -- | Covered, Uncovered, Divergent
