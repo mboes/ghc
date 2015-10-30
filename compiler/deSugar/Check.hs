@@ -76,9 +76,9 @@ The algorithm used is described in the paper:
 
 type PmM a = DsM a
 
-data PmConstraint = TmConstraint Id PmExpr -- Term equalities: x ~ e
-                  | TyConstraint [EvVar]   -- Type equalities
-                  | BtConstraint Id        -- Strictness constraints: x ~ _|_
+-- || data PmConstraint = TmConstraint Id PmExpr -- Term equalities: x ~ e
+-- ||                   | TyConstraint [EvVar]   -- Type equalities
+-- ||                   | BtConstraint Id        -- Strictness constraints: x ~ _|_
 
 -- The *arity* of a PatVec [p1,..,pn] is
 -- the number of p1..pn that are not Guards
@@ -103,19 +103,16 @@ type ValVecAbs = [ValAbs]  -- Value Vector Abstractions
 --     MkT :: forall p q. (Eq p, Ord q) => p -> q -> T [p]
 -- or  MkT :: forall p q r. (Eq p, Ord q, [p] ~ r) => p -> q -> T r
 
-data ValSetAbs   -- Reprsents a set of value vector abstractions
-                 -- Notionally each value vector abstraction is a triple:
-                 --   (Gamma |- us |> Delta)
-                 -- where 'us'    is a ValueVec
-                 --       'Delta' is a constraint
-  -- INVARIANT VsaInvariant: an empty ValSetAbs is always represented by Empty
-  -- INVARIANT VsaArity: the number of Cons's in any path to a leaf is the same
-  -- The *arity* of a ValSetAbs is the number of Cons's in any path to a leaf
-  = Empty                               -- {}
-  | Union ValSetAbs ValSetAbs           -- S1 u S2
-  | Singleton                           -- { |- empty |> empty }
-  | Constraint [PmConstraint] ValSetAbs -- Extend Delta
-  | Cons ValAbs ValSetAbs               -- map (ucon u) vs
+type TyCs  = Bag EvVar
+type Delta = (TmState, TyCs) -- bot cs is resolved immediately? NO!!
+
+type ValVecAbsNew = (ValVecAbs, Delta) -- Guarded value vector abstraction, just like the paper
+type UncoveredVec = ValVecAbsNew
+
+type ValSetAbs = [ValVecAbsNew]
+type   CoveredSet = [ValVecAbsNew]
+type UncoveredSet = [ValVecAbsNew]
+type DivergentSet = [ValVecAbsNew]
 
 type PmResult = ( [[LPat Id]] -- redundant clauses
                 , [[LPat Id]] -- clauses with inaccessible rhs
@@ -164,12 +161,13 @@ checkMatches vars matches
         (False, True)  -> (  rs, m:is, us')
         (False, False) -> (m:rs,   is, us')
 
-initial_uncovered :: [Id] -> DsM ValSetAbs
+initial_uncovered :: [Id] -> DsM UncoveredSet
 initial_uncovered vars = do
-  ty_cs <- mkTyConstraint . bagToList <$> getDictsDs
-  tm_cs <- map (uncurry TmConstraint) . bagToList <$> getTmCsDs
-  let vsa = map (VA . PmVar) vars
-  return $ mkConstraint (ty_cs ++ tm_cs) (foldr Cons Singleton vsa)
+  ty_cs <- getDictsDs
+  tm_cs <- bagToList <$> getTmCsDs
+  return $ case tmOracle initialTmState tm_cs of
+    Nothing -> [] -- nothing will happen. we are in an inaccessible branch already
+    Just tm -> [(map (VA . PmVar) vars, (tm, ty_cs))]
 
 {-
 %************************************************************************
@@ -489,23 +487,23 @@ translateBoolGuard e
 -- ----------------------------------------------------------------------------
 -- | Process a vector
 
--- Covered, Uncovered, Divergent
-process_guards :: UniqSupply -> [PatVec] -> (ValSetAbs, ValSetAbs, ValSetAbs)
-process_guards _us [] = (Singleton, Empty, Empty) -- No guard == True guard
-process_guards us  gs
-  | any null gs = (Singleton, Empty, Singleton) -- Contains an empty guard? == it is exhaustive [Too conservative for divergence]
-  | otherwise   = go us Singleton gs
-  where
-    go _usupply missing []       = (Empty, missing, Empty)
-    go  usupply missing (gv:gvs) = (mkUnion cs css, uss, mkUnion ds dss)
-      where
-        (us1, us2, us3, us4) = splitUniqSupply4 usupply
-
-        cs = covered   us1 Singleton gv missing
-        us = uncovered us2 Empty     gv missing
-        ds = divergent us3 Empty     gv missing
-
-        (css, uss, dss) = go us4 us gvs
+-- || -- Covered, Uncovered, Divergent
+-- || process_guards :: UniqSupply -> [PatVec] -> (ValSetAbs, ValSetAbs, ValSetAbs)
+-- || process_guards _us [] = (Singleton, Empty, Empty) -- No guard == True guard
+-- || process_guards us  gs
+-- ||   | any null gs = (Singleton, Empty, Singleton) -- Contains an empty guard? == it is exhaustive [Too conservative for divergence]
+-- ||   | otherwise   = go us Singleton gs
+-- ||   where
+-- ||     go _usupply missing []       = (Empty, missing, Empty)
+-- ||     go  usupply missing (gv:gvs) = (mkUnion cs css, uss, mkUnion ds dss)
+-- ||       where
+-- ||         (us1, us2, us3, us4) = splitUniqSupply4 usupply
+-- || 
+-- ||         cs = covered   us1 Singleton gv missing
+-- ||         us = uncovered us2 Empty     gv missing
+-- ||         ds = divergent us3 Empty     gv missing
+-- || 
+-- ||         (css, uss, dss) = go us4 us gvs
 
 -- ----------------------------------------------------------------------------
 -- | Getting some more uniques
@@ -540,7 +538,7 @@ pmPatType (PmCon { pm_con_con = con, pm_con_arg_tys = tys })
                                      = mkTyConApp (dataConTyCon con) tys
 pmPatType (PmVar { pm_var_id  = x }) = idType x
 
-mkOneConFull :: Id -> UniqSupply -> DataCon -> (PmPat ValAbs, [PmConstraint])
+mkOneConFull2 :: Id -> UniqSupply -> DataCon -> (PmPat ValAbs, [SimpleEq], TyCs)
 --  *  x :: T tys, where T is an algebraic data type
 --     NB: in the case of a data familiy, T is the *representation* TyCon
 --     e.g.   data instance T (a,b) = T1 a b
@@ -555,8 +553,7 @@ mkOneConFull :: Id -> UniqSupply -> DataCon -> (PmPat ValAbs, [PmConstraint])
 --
 -- Results: ValAbs:          K (y1::s1) .. (yn::sn)
 --          [PmConstraint]:  Q, x ~ K y1..yn
-
-mkOneConFull x usupply con = (con_abs, constraints)
+mkOneConFull2 x usupply con = (con_abs, tm_cs, ty_cs)
   where
 
     (usupply1, usupply2, usupply3) = splitUniqSupply3 usupply
@@ -566,7 +563,7 @@ mkOneConFull x usupply con = (con_abs, constraints)
     data_tc = dataConTyCon con   -- The representation TyCon
     tc_args = case splitTyConApp_maybe res_ty of
                  Just (tc, tys) -> ASSERT( tc == data_tc ) tys
-                 Nothing -> pprPanic "mkOneConFull: Not TyConApp:" (ppr res_ty)
+                 Nothing -> pprPanic "mkOneConFull2: Not TyConApp:" (ppr res_ty)
 
     subst1  = zipTopTvSubst univ_tvs tc_args
 
@@ -583,74 +580,77 @@ mkOneConFull x usupply con = (con_abs, constraints)
                        , pm_con_args    = arguments }
 
     -- type and term constraints
-    constraints = TmConstraint x (pmPatToPmExpr con_abs) : mkTyConstraint evvars
+    tm_cs = [(x, pmPatToPmExpr con_abs)]
+    ty_cs = listToBag evvars
 
 mkConVars :: UniqSupply -> [Type] -> [ValAbs] -- ys, fresh with the given type
 mkConVars us tys = zipWith mkValAbsVar (listSplitUniqSupply us) tys
 
+-- || 
+-- || tailValSetAbs :: ValSetAbs -> ValSetAbs
+-- || tailValSetAbs Empty               = Empty
+-- || tailValSetAbs Singleton           = panic "tailValSetAbs: Singleton"
+-- || tailValSetAbs (Union vsa1 vsa2)   = tailValSetAbs vsa1 `mkUnion` tailValSetAbs vsa2
+-- || tailValSetAbs (Constraint cs vsa) = cs `mkConstraint` tailValSetAbs vsa
+-- || tailValSetAbs (Cons _ vsa)        = vsa -- actual work
 
-tailValSetAbs :: ValSetAbs -> ValSetAbs
-tailValSetAbs Empty               = Empty
-tailValSetAbs Singleton           = panic "tailValSetAbs: Singleton"
-tailValSetAbs (Union vsa1 vsa2)   = tailValSetAbs vsa1 `mkUnion` tailValSetAbs vsa2
-tailValSetAbs (Constraint cs vsa) = cs `mkConstraint` tailValSetAbs vsa
-tailValSetAbs (Cons _ vsa)        = vsa -- actual work
+-- || -- update this (pass the additional (type-related) arguments)
+-- || wrapK :: DataCon -> [Type] -> [TyVar] -> [EvVar] -> ValSetAbs -> ValSetAbs
+-- || wrapK con arg_tys ex_tvs dicts = wrapK_aux (dataConSourceArity con) emptylist
+-- ||   where
+-- ||     wrapK_aux :: Int -> DList ValAbs -> ValSetAbs -> ValSetAbs
+-- ||     wrapK_aux _ _    Empty               = Empty
+-- ||     wrapK_aux 0 args vsa                 = VA (PmCon { pm_con_con  = con, pm_con_arg_tys = arg_tys
+-- ||                                                      , pm_con_tvs  = ex_tvs, pm_con_dicts = dicts
+-- ||                                                      , pm_con_args = toList args }) `mkCons` vsa
+-- ||     wrapK_aux _ _    Singleton           = panic "wrapK: Singleton"
+-- ||     wrapK_aux n args (Cons vs vsa)       = wrapK_aux (n-1) (args `snoc` vs) vsa
+-- ||     wrapK_aux n args (Constraint cs vsa) = cs `mkConstraint` wrapK_aux n args vsa
+-- ||     wrapK_aux n args (Union vsa1 vsa2)   = wrapK_aux n args vsa1 `mkUnion` wrapK_aux n args vsa2
+utail :: ValSetAbs -> ValSetAbs
+utail vsa = [ (vva, tm) | (_:vva, tm) <- vsa ]
+{-# INLINE utail #-}
 
--- update this (pass the additional (type-related) arguments)
-wrapK :: DataCon -> [Type] -> [TyVar] -> [EvVar] -> ValSetAbs -> ValSetAbs
-wrapK con arg_tys ex_tvs dicts = wrapK_aux (dataConSourceArity con) emptylist
-  where
-    wrapK_aux :: Int -> DList ValAbs -> ValSetAbs -> ValSetAbs
-    wrapK_aux _ _    Empty               = Empty
-    wrapK_aux 0 args vsa                 = VA (PmCon { pm_con_con  = con, pm_con_arg_tys = arg_tys
-                                                     , pm_con_tvs  = ex_tvs, pm_con_dicts = dicts
-                                                     , pm_con_args = toList args }) `mkCons` vsa
-    wrapK_aux _ _    Singleton           = panic "wrapK: Singleton"
-    wrapK_aux n args (Cons vs vsa)       = wrapK_aux (n-1) (args `snoc` vs) vsa
-    wrapK_aux n args (Constraint cs vsa) = cs `mkConstraint` wrapK_aux n args vsa
-    wrapK_aux n args (Union vsa1 vsa2)   = wrapK_aux n args vsa1 `mkUnion` wrapK_aux n args vsa2
+ucon :: ValAbs -> ValSetAbs -> ValSetAbs
+ucon va vsa = [ (va:vva, tm) | (vva, tm) <- vsa ]
+{-# INLINE ucon #-}
 
-newtype DList a = DL { unDL :: [a] -> [a] }
+kcon :: DataCon -> [Type] -> [TyVar] -> [EvVar] -> ValSetAbs -> ValSetAbs
+kcon con arg_tys ex_tvs dicts vsa = [ kconOne con arg_tys ex_tvs dicts vva | vva <- vsa ]
+{-# INLINE kcon #-}
 
-toList :: DList a -> [a]
-toList = ($[]) . unDL
-{-# INLINE toList #-}
-
-emptylist :: DList a
-emptylist = DL id
-{-# INLINE emptylist #-}
-
-infixl `snoc`
-snoc :: DList a -> a -> DList a
-snoc xs x = DL (unDL xs . (x:))
-{-# INLINE snoc #-}
+kconOne :: DataCon -> [Type] -> [TyVar] -> [EvVar] -> ValVecAbsNew -> ValVecAbsNew
+kconOne con arg_tys ex_tvs dicts (vva, tm) = (va:rest, tm)
+  where (args, rest) = splitAt (dataConSourceArity con) vva
+        va = VA (PmCon con arg_tys ex_tvs dicts args)
+{-# INLINE kconOne #-}
 
 -- ----------------------------------------------------------------------------
 -- | Smart Value Set Abstraction constructors
 -- (NB: An empty value set can only be represented as `Empty')
 
-mkTyConstraint :: [EvVar] -> [PmConstraint]
-mkTyConstraint [] = []
-mkTyConstraint cs = [TyConstraint cs] -- don't generate a PmConstraint if
-                                      -- there are no constraints
-
-mkConstraint :: [PmConstraint] -> ValSetAbs -> ValSetAbs
--- The smart constructor for Constraint (maintains VsaInvariant)
-mkConstraint []  vsa                  = vsa -- nothing to add? do nothing then :)
-mkConstraint _cs Empty                = Empty
-mkConstraint cs1 (Constraint cs2 vsa) = Constraint (cs1++cs2) vsa -- careful about associativity
-mkConstraint cs  other_vsa            = Constraint cs other_vsa
-
-mkUnion :: ValSetAbs -> ValSetAbs -> ValSetAbs
--- The smart constructor for Union (maintains VsaInvariant)
-mkUnion Empty vsa = vsa
-mkUnion vsa Empty = vsa
-mkUnion vsa1 vsa2 = Union vsa1 vsa2
-
-mkCons :: ValAbs -> ValSetAbs -> ValSetAbs
--- The smart constructor for Cons (maintains VsaInvariant)
-mkCons _ Empty = Empty
-mkCons va vsa  = Cons va vsa
+-- || mkTyConstraint :: [EvVar] -> [PmConstraint]
+-- || mkTyConstraint [] = []
+-- || mkTyConstraint cs = [TyConstraint cs] -- don't generate a PmConstraint if
+-- ||                                       -- there are no constraints
+-- || 
+-- || mkConstraint :: [PmConstraint] -> ValSetAbs -> ValSetAbs
+-- || -- The smart constructor for Constraint (maintains VsaInvariant)
+-- || mkConstraint []  vsa                  = vsa -- nothing to add? do nothing then :)
+-- || mkConstraint _cs Empty                = Empty
+-- || mkConstraint cs1 (Constraint cs2 vsa) = Constraint (cs1++cs2) vsa -- careful about associativity
+-- || mkConstraint cs  other_vsa            = Constraint cs other_vsa
+-- || 
+-- || mkUnion :: ValSetAbs -> ValSetAbs -> ValSetAbs
+-- || -- The smart constructor for Union (maintains VsaInvariant)
+-- || mkUnion Empty vsa = vsa
+-- || mkUnion vsa Empty = vsa
+-- || mkUnion vsa1 vsa2 = Union vsa1 vsa2
+-- || 
+-- || mkCons :: ValAbs -> ValSetAbs -> ValSetAbs
+-- || -- The smart constructor for Cons (maintains VsaInvariant)
+-- || mkCons _ Empty = Empty
+-- || mkCons va vsa  = Cons va vsa
 
 -- ----------------------------------------------------------------------------
 -- | More smart constructors and fresh variable generation
@@ -744,15 +744,15 @@ nameType name usupply ty = newEvVar idname ty
 -- valSetAbsToList (Constraint cs vsa) = [(vs, cs ++ cs') | (vs, cs') <- valSetAbsToList vsa]
 -- valSetAbsToList (Cons va vsa)       = [(va:vs, cs) | (vs, cs) <- valSetAbsToList vsa]
 
-splitConstraints :: [PmConstraint] -> ([EvVar], [(Id, PmExpr)], Maybe Id) -- Type constraints, term constraints, forced variables
-splitConstraints [] = ([],[],Nothing)
-splitConstraints (c : rest)
-  = case c of
-      TyConstraint cs  -> (cs ++ ty_cs, tm_cs, bot_cs)
-      TmConstraint x e -> (ty_cs, (x,e):tm_cs, bot_cs)
-      BtConstraint cs  -> ASSERT (isNothing bot_cs) (ty_cs, tm_cs, Just cs) -- NB: Only one x ~ _|_
-  where
-    (ty_cs, tm_cs, bot_cs) = splitConstraints rest
+-- || splitConstraints :: [PmConstraint] -> ([EvVar], [(Id, PmExpr)], Maybe Id) -- Type constraints, term constraints, forced variables
+-- || splitConstraints [] = ([],[],Nothing)
+-- || splitConstraints (c : rest)
+-- ||   = case c of
+-- ||       TyConstraint cs  -> (cs ++ ty_cs, tm_cs, bot_cs)
+-- ||       TmConstraint x e -> (ty_cs, (x,e):tm_cs, bot_cs)
+-- ||       BtConstraint cs  -> ASSERT (isNothing bot_cs) (ty_cs, tm_cs, Just cs) -- NB: Only one x ~ _|_
+-- ||   where
+-- ||     (ty_cs, tm_cs, bot_cs) = splitConstraints rest
 
 {-
 %************************************************************************
@@ -762,73 +762,93 @@ splitConstraints (c : rest)
 %************************************************************************
 -}
 
-anySatValSetAbs :: ValSetAbs -> PmM Bool
-anySatValSetAbs vsa = notNull <$> pruneTy 1 vsa
+-- || anySatValSetAbs :: ValSetAbs -> PmM Bool
+-- || anySatValSetAbs vsa = notNull <$> pruneTy 1 vsa
 
-mergeBotCs :: Maybe Id -> Maybe Id -> Maybe Id
-mergeBotCs (Just x) Nothing  = Just x
-mergeBotCs Nothing  (Just y) = Just y
-mergeBotCs Nothing  Nothing  = Nothing
-mergeBotCs (Just _) (Just _) = panic "mergeBotCs: two (x ~ _|_) constraints"
+-- || mergeBotCs :: Maybe Id -> Maybe Id -> Maybe Id
+-- || mergeBotCs (Just x) Nothing  = Just x
+-- || mergeBotCs Nothing  (Just y) = Just y
+-- || mergeBotCs Nothing  Nothing  = Nothing
+-- || mergeBotCs (Just _) (Just _) = panic "mergeBotCs: two (x ~ _|_) constraints"
 
 wrapUpTmState :: TmState -> ([ComplexEq], PmVarEnv)
 wrapUpTmState (residual, (_unhandled, subst)) = (residual, flattenPmVarEnv subst)
 
 -- ----------------------------------------------------------------------------
 
-pruneTm :: ValSetAbs -> ValSetAbs
-pruneTm = pruneTmVSA (initialTmState, Nothing)
-  where
-    pruneTmVSA :: (TmState, Maybe Id) -> ValSetAbs -> ValSetAbs
-    pruneTmVSA all_cs@(tm_env, bot_ct) in_vsa = case in_vsa of
-      Empty             -> Empty
-      Union vsa1 vsa2   -> pruneTmVSA all_cs vsa1 `mkUnion` pruneTmVSA all_cs vsa2
-      Singleton         -> Singleton
-      Cons va vsa       -> va `mkCons` pruneTmVSA all_cs vsa
-      Constraint cs vsa -> case splitConstraints cs of
-        (_ty_cs, new_tm_cs, new_bot_ct) -> case tmOracle tm_env new_tm_cs of
-          Just (new_tm_env@(residual, (expr_eqs, subst))) ->
-            let bot = mergeBotCs new_bot_ct bot_ct
-                ans = isNothing bot || notNull residual || expr_eqs || notForced (fromJust bot) subst
-            in  if ans then cs `mkConstraint` pruneTmVSA (new_tm_env, bot) vsa
-                       else Empty
-          Nothing -> Empty
+-- || pruneTm :: ValSetAbs -> ValSetAbs
+-- || pruneTm = pruneTmVSA (initialTmState, Nothing)
+-- ||   where
+-- ||     pruneTmVSA :: (TmState, Maybe Id) -> ValSetAbs -> ValSetAbs
+-- ||     pruneTmVSA all_cs@(tm_env, bot_ct) in_vsa = case in_vsa of
+-- ||       Empty             -> Empty
+-- ||       Union vsa1 vsa2   -> pruneTmVSA all_cs vsa1 `mkUnion` pruneTmVSA all_cs vsa2
+-- ||       Singleton         -> Singleton
+-- ||       Cons va vsa       -> va `mkCons` pruneTmVSA all_cs vsa
+-- ||       Constraint cs vsa -> case splitConstraints cs of
+-- ||         (_ty_cs, new_tm_cs, new_bot_ct) -> case tmOracle tm_env new_tm_cs of
+-- ||           Just (new_tm_env@(residual, (expr_eqs, subst))) ->
+-- ||             let bot = mergeBotCs new_bot_ct bot_ct
+-- ||                 ans = isNothing bot || notNull residual || expr_eqs || notForced (fromJust bot) subst
+-- ||             in  if ans then cs `mkConstraint` pruneTmVSA (new_tm_env, bot) vsa
+-- ||                        else Empty
+-- ||           Nothing -> Empty
 
 -- -- ----------------------------------------------------------------------------
-
--- since this calls the term oracle too (just to get back the final substitution),
--- it may be a good idea to remove the checks in the `Constraint` case and just
--- get the result of the term oracle.
-pruneTy :: Int -> ValSetAbs -> PmM [([PmExpr], [ComplexEq])] -- the vector as a list of om exprs and the residual eqs
-pruneTy n v = pruneTy' n init_cs emptylist v
-  where
-    init_cs :: ([EvVar], TmState, Maybe Id)
-    init_cs = ([], initialTmState, Nothing)
-
-    pruneTy' :: Int -> ([EvVar], TmState, Maybe Id) -> DList ValAbs -> ValSetAbs -> PmM [([PmExpr], [ComplexEq])]
-    pruneTy' n all_cs@(ty_cs, tm_env, bot_ct) vec in_vsa
-      | n <= 0    = return [] -- no need to keep going
-      | otherwise = case in_vsa of
-          Empty -> return []
-          Union vsa1 vsa2 -> do
-            vecs1 <- pruneTy' n                  all_cs vec vsa1
-            vecs2 <- pruneTy' (n - length vecs1) all_cs vec vsa2
-            return (vecs1 ++ vecs2)
-          Singleton -> do
-            sat <- tyOracle (listToBag ty_cs) -- it would be nice to have this incremental too
-            return $ case sat of
-              True  -> let (residual_eqs, subst) = wrapUpTmState tm_env
-                           vector = substInValVecAbs subst (toList vec)
-                       in  [(vector, residual_eqs)]
-              False -> []
-          Constraint cs vsa -> case splitConstraints cs of -- undefined {- FIXME -}
-            (new_ty_cs, new_tm_cs, new_bot_ct) -> case tmOracle tm_env new_tm_cs of
-                Just new_tm_env -> pruneTy' n (new_ty_cs++ty_cs, new_tm_env, mergeBotCs new_bot_ct bot_ct) vec vsa
-                Nothing         -> return []
-          Cons va vsa -> pruneTy' n all_cs (vec `snoc` va) vsa
+pruneTy :: Int -> ValSetAbs -> PmM [([PmExpr], [ComplexEq])]
+pruneTy _ [] = return [] -- not enough but nothing left
+pruneTy n ((vec, (tm_state, ty_cs)):vecs)
+  | n > 0 = do
+     sat <- tyOracle ty_cs
+     case sat of
+       True  -> do
+         let (residual_eqs, subst) = wrapUpTmState tm_state
+         let vector = substInValVecAbs subst vec
+         rest <- pruneTy (n-1) vecs
+         return ((vector, residual_eqs):rest)
+       False -> pruneTy n vecs
+  | otherwise = return []
 
 substInValVecAbs :: PmVarEnv -> ValVecAbs -> [PmExpr]
 substInValVecAbs subst = map (exprDeepLookup subst . valAbsToPmExpr)
+
+anySatTy :: ValSetAbs -> PmM Bool
+anySatTy [] = return False
+anySatTy ((_, (_, ty_cs)):vsa) = do
+  sat <- tyOracle ty_cs
+  if sat then return True
+         else anySatTy vsa
+
+-- || -- since this calls the term oracle too (just to get back the final substitution),
+-- || -- it may be a good idea to remove the checks in the `Constraint` case and just
+-- || -- get the result of the term oracle.
+-- || pruneTy :: Int -> ValSetAbs -> PmM [([PmExpr], [ComplexEq])] -- the vector as a list of om exprs and the residual eqs
+-- || pruneTy n v = pruneTy' n init_cs emptylist v
+-- ||   where
+-- ||     init_cs :: ([EvVar], TmState, Maybe Id)
+-- ||     init_cs = ([], initialTmState, Nothing)
+-- || 
+-- ||     pruneTy' :: Int -> ([EvVar], TmState, Maybe Id) -> DList ValAbs -> ValSetAbs -> PmM [([PmExpr], [ComplexEq])]
+-- ||     pruneTy' n all_cs@(ty_cs, tm_env, bot_ct) vec in_vsa
+-- ||       | n <= 0    = return [] -- no need to keep going
+-- ||       | otherwise = case in_vsa of
+-- ||           Empty -> return []
+-- ||           Union vsa1 vsa2 -> do
+-- ||             vecs1 <- pruneTy' n                  all_cs vec vsa1
+-- ||             vecs2 <- pruneTy' (n - length vecs1) all_cs vec vsa2
+-- ||             return (vecs1 ++ vecs2)
+-- ||           Singleton -> do
+-- ||             sat <- tyOracle (listToBag ty_cs) -- it would be nice to have this incremental too
+-- ||             return $ case sat of
+-- ||               True  -> let (residual_eqs, subst) = wrapUpTmState tm_env
+-- ||                            vector = substInValVecAbs subst (toList vec)
+-- ||                        in  [(vector, residual_eqs)]
+-- ||               False -> []
+-- ||           Constraint cs vsa -> case splitConstraints cs of -- undefined {- FIXME -}
+-- ||             (new_ty_cs, new_tm_cs, new_bot_ct) -> case tmOracle tm_env new_tm_cs of
+-- ||                 Just new_tm_env -> pruneTy' n (new_ty_cs++ty_cs, new_tm_env, mergeBotCs new_bot_ct bot_ct) vec vsa
+-- ||                 Nothing         -> return []
+-- ||           Cons va vsa -> pruneTy' n all_cs (vec `snoc` va) vsa
 
 
 
@@ -876,27 +896,27 @@ patternArity :: Pattern -> PmArity
 patternArity (PmGuard  {}) = 0
 patternArity (NonGuard {}) = 1
 
--- Should get a default value because an empty set has any arity
--- (We have no value vector abstractions to see)
-vsaArity :: PmArity -> ValSetAbs -> PmArity
-vsaArity  arity Empty = arity
-vsaArity _arity vsa   = ASSERT (allTheSame arities) (head arities)
-  where arities = vsaArities vsa
-
-vsaArities :: ValSetAbs -> [PmArity] -- Arity for every path. INVARIANT: All the same
-vsaArities Empty              = []
-vsaArities (Union vsa1 vsa2)  = vsaArities vsa1 ++ vsaArities vsa2
-vsaArities Singleton          = [0]
-vsaArities (Constraint _ vsa) = vsaArities vsa
-vsaArities (Cons _ vsa)       = [1 + arity | arity <- vsaArities vsa]
-
-allTheSame :: Eq a => [a] -> Bool
-allTheSame []     = True
-allTheSame (x:xs) = all (==x) xs
-
-sameArity :: PatVec -> ValSetAbs -> Bool
-sameArity pv vsa = vsaArity pv_a vsa == pv_a
-  where pv_a = patVecArity pv
+-- || -- Should get a default value because an empty set has any arity
+-- || -- (We have no value vector abstractions to see)
+-- || vsaArity :: PmArity -> ValSetAbs -> PmArity
+-- || vsaArity  arity Empty = arity
+-- || vsaArity _arity vsa   = ASSERT (allTheSame arities) (head arities)
+-- ||   where arities = vsaArities vsa
+-- || 
+-- || vsaArities :: ValSetAbs -> [PmArity] -- Arity for every path. INVARIANT: All the same
+-- || vsaArities Empty              = []
+-- || vsaArities (Union vsa1 vsa2)  = vsaArities vsa1 ++ vsaArities vsa2
+-- || vsaArities Singleton          = [0]
+-- || vsaArities (Constraint _ vsa) = vsaArities vsa
+-- || vsaArities (Cons _ vsa)       = [1 + arity | arity <- vsaArities vsa]
+-- || 
+-- || allTheSame :: Eq a => [a] -> Bool
+-- || allTheSame []     = True
+-- || allTheSame (x:xs) = all (==x) xs
+-- || 
+-- || sameArity :: PatVec -> ValSetAbs -> Bool
+-- || sameArity pv vsa = vsaArity pv_a vsa == pv_a
+-- ||   where pv_a = patVecArity pv
 
 {-
 %************************************************************************
@@ -906,21 +926,31 @@ sameArity pv vsa = vsaArity pv_a vsa == pv_a
 %************************************************************************
 -}
 
-patVectProc :: (PatVec, [PatVec]) -> ValSetAbs -> PmM (Bool, Bool, ValSetAbs) -- Covers? Forces? U(n+1)?
+patVectProc :: (PatVec, [PatVec]) -> UncoveredSet -> PmM (Bool, Bool, UncoveredSet)
 patVectProc (vec,gvs) vsa = do
   us <- getUniqueSupplyM
-  let (c_def, u_def, d_def) = process_guards us gvs -- default (the continuation)
   (usC, usU, usD) <- getUniqueSupplyM3
-  mb_c <- anySatValSetAbs $ pruneTm (covered   usC c_def vec vsa)
-  mb_d <- anySatValSetAbs $ pruneTm (divergent usD d_def vec vsa)
-  let vsa' = pruneTm $ uncovered usU u_def vec vsa
+  mb_c <- anySatTy $   covered usC gvs vec vsa
+  mb_d <- anySatTy $ divergent usD gvs vec vsa
+  let vsa' = uncovered usU gvs vec vsa
   return (mb_c, mb_d, vsa')
 
--- | Covered, Uncovered, Divergent
-covered, uncovered, divergent :: UniqSupply -> ValSetAbs -> PatVec -> ValSetAbs -> ValSetAbs
-covered   us gvsa vec vsa = pmTraverse us gvsa cMatcher vec vsa
-uncovered us gvsa vec vsa = pmTraverse us gvsa uMatcher vec vsa
-divergent us gvsa vec vsa = pmTraverse us gvsa dMatcher vec vsa
+
+-- || patVectProc :: (PatVec, [PatVec]) -> ValSetAbs -> PmM (Bool, Bool, ValSetAbs) -- Covers? Forces? U(n+1)?
+-- || patVectProc (vec,gvs) vsa = do
+-- ||   us <- getUniqueSupplyM
+-- ||   let (c_def, u_def, d_def) = process_guards us gvs -- default (the continuation)
+-- ||   (usC, usU, usD) <- getUniqueSupplyM3
+-- ||   mb_c <- anySatValSetAbs $ pruneTm (covered   usC c_def vec vsa)
+-- ||   mb_d <- anySatValSetAbs $ pruneTm (divergent usD d_def vec vsa)
+-- ||   let vsa' = pruneTm $ uncovered usU u_def vec vsa
+-- ||   return (mb_c, mb_d, vsa')
+-- || 
+-- || -- | Covered, Uncovered, Divergent
+-- || covered, uncovered, divergent :: UniqSupply -> ValSetAbs -> PatVec -> ValSetAbs -> ValSetAbs
+-- || covered   us gvsa vec vsa = pmTraverse us gvsa cMatcher vec vsa
+-- || uncovered us gvsa vec vsa = pmTraverse us gvsa uMatcher vec vsa
+-- || divergent us gvsa vec vsa = pmTraverse us gvsa dMatcher vec vsa
 
 -- ----------------------------------------------------------------------------
 -- | Generic traversal function
@@ -932,122 +962,328 @@ divergent us gvsa vec vsa = pmTraverse us gvsa dMatcher vec vsa
 -- Guard-Case since it is common for all). The actual work is done by functions
 -- `cMatcher', `uMatcher' and `dMatcher' below.
 
-pmTraverse :: UniqSupply
-           -> ValSetAbs -- gvsa
-           -> PmMatcher -- what to do
-           -> PatVec
-           -> ValSetAbs
-           -> ValSetAbs
-pmTraverse _us _gvsa _rec _vec Empty      = Empty
-pmTraverse _us  gvsa _rec []   Singleton  = gvsa
-pmTraverse _us _gvsa _rec []   (Cons _ _) = panic "pmTraverse: cons"
-pmTraverse  us  gvsa  rec vec  (Union vsa1 vsa2)
-  = mkUnion (pmTraverse us1 gvsa rec vec vsa1)
-            (pmTraverse us2 gvsa rec vec vsa2)
+-- ----------------------------------------------------------------------------
+-- ----------------------------------------------------------------------------
+-- | The following are responsible for the guards. Maybe we should merge them:
+--     * Covered   can come as a by-product of uncovered
+--     * Divergent can come as a by-product of   covered
+--
+-- | Check whether merging them is efficient and readable. If we do this we get
+--   the most of our repserentation.
+-- ----------------------------------------------------------------------------
+
+covered_guards :: UniqSupply -> [PatVec] -> UncoveredSet -> CoveredSet
+covered_guards _us []       _   = []
+covered_guards  us (gv:gvs) vsa = cvsa_1 ++ cvsa_n
+  where (us1, us2, us3) = splitUniqSupply3 us
+        cvsa_1 =   covered us1 [] gv vsa
+        uvsa_1 = uncovered us2 [] gv vsa
+        cvsa_n = covered_guards us3 gvs uvsa_1
+
+uncovered_guards :: UniqSupply -> [PatVec] -> UncoveredSet -> UncoveredSet
+uncovered_guards _us []       vsa = vsa
+uncovered_guards  us (gv:gvs) vsa = uvsa_all
   where (us1, us2) = splitUniqSupply us
-pmTraverse us gvsa rec vec (Constraint cs vsa)
-  = mkConstraint cs (pmTraverse us gvsa rec vec vsa)
-pmTraverse us gvsa rec (p:ps) vsa =
-  case p of
-    -- Guard Case
-    PmGuard pv e ->
-      let (us1, us2) = splitUniqSupply us
-          y  = mkPmId us1 (patternType p)
-          cs = [TmConstraint y e]
-      in  mkConstraint cs $ tailValSetAbs $
-            pmTraverse us2 gvsa rec (pv++ps) (VA (PmVar y) `mkCons` vsa)
+        uvsa_new   = uncovered us1 [] gv vsa
+        uvsa_all   = uncovered_guards us2 gvs uvsa_new
 
-    -- Constructor/Variable/Literal Case
-    NonGuard pat
-      | Cons (VA va) vsa <- vsa -> rec us gvsa pat ps va vsa
-      | otherwise               -> panic "pmTraverse: singleton" -- can't be anything else
+divergent_guards :: UniqSupply -> [PatVec] -> UncoveredSet -> CoveredSet
+divergent_guards _us []       _   = []
+divergent_guards  us (gv:gvs) vsa = dvsa_1 ++ dvsa_n
+  where (us1, us2, us3) = splitUniqSupply3 us
+        dvsa_1 = divergent us1 [] gv vsa
+        uvsa_1 = uncovered us2 [] gv vsa
+        dvsa_n = divergent_guards us3 gvs uvsa_1
 
-type PmMatcher =  UniqSupply
-               -> ValSetAbs
-               -> PmPat Pattern -> PatVec -- pattern vector head and tail
-               -> PmPat ValAbs  -> ValSetAbs -- value set abstraction head and tail
-               -> ValSetAbs
-
--- | cMatcher
 -- ----------------------------------------------------------------------------
-cMatcher :: PmMatcher
-
--- CVar
-cMatcher us gvsa (PmVar x) ps va vsa
-  = VA va `mkCons` (cs `mkConstraint` covered us gvsa ps vsa)
-  where cs = [TmConstraint x (pmPatToPmExpr va)]
-
--- CConCon
-cMatcher us gvsa (p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
-                    (PmCon { pm_con_con = c2, pm_con_args = args2 }) vsa
-  | c1 /= c2  = Empty
-  | otherwise = wrapK c1 (pm_con_arg_tys p)
-                         (pm_con_tvs     p)
-                         (pm_con_dicts   p)
-                         (covered us gvsa (args1 ++ ps) (foldr mkCons vsa args2))
-
--- CConVar
-cMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa
-  = cMatcher us2 gvsa p ps con_abs (mkConstraint all_cs vsa)
-  where
-    (us1, us2)        = splitUniqSupply us
-    (con_abs, all_cs) = mkOneConFull x us1 con
-
--- | uMatcher
 -- ----------------------------------------------------------------------------
-uMatcher :: PmMatcher
 
--- UVar
-uMatcher us gvsa (PmVar x) ps va vsa
-  = VA va `mkCons` (cs `mkConstraint` uncovered us gvsa ps vsa)
-  where cs = [TmConstraint x (pmPatToPmExpr va)]
+covered_list :: UniqSupply
+             -> [PatVec] -- Translated Guards
+             -> PatVec        -- Current Clause
+             -> UncoveredVec  -- Uncovered (one vector ONLY)
+             -> CoveredSet    -- Covered
+covered_list us gvsa [] vva
+  | null gvsa = [vva]   -- No Guards
+  | otherwise = covered_guards us gvsa [vva]
 
--- UConCon
-uMatcher us gvsa ( p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
-                 (va@(PmCon { pm_con_con = c2, pm_con_args = args2 })) vsa
-  | c1 /= c2  = VA va `mkCons` vsa
-  | otherwise = wrapK c1 (pm_con_arg_tys p)
-                         (pm_con_tvs     p)
-                         (pm_con_dicts   p)
-                         (uncovered us gvsa (args1 ++ ps) (foldr mkCons vsa args2))
+covered_list us gvsa (p@(PmGuard pv e) : ps) (vva, (tm_cs, ty_cs)) {- [CGuard]  -} -- YOU JUST HAVE TO IMPLEMENT THIS TOO
+  | Just new_tm <- tmOracle tm_cs [(y,e)]
+  = utail $ covered_list us2 gvsa (pv++ps) (VA (PmVar y) : vva, (new_tm, ty_cs))
+  | otherwise = [] -- Mismatch (Can't happen. Why? Because y is fresh)
+  where (us1, us2) = splitUniqSupply us
+        y  = mkPmId us1 (patternType p)
+covered_list us gvsa (NonGuard p   : ps) (VA va : vva, cs) = covered_list_matcher us gvsa p ps va (vva, cs)
+covered_list us gvsa (NonGuard _   : _)  ([],           _) = panic "covered_list: length mismatch (left)"
+covered_list us gvsa []                  (_:_,          _) = panic "covered_list: length mismatch (right)"
 
--- UConVar
-uMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa
-  = uncovered us2 gvsa (NonGuard p : ps) inst_vsa -- instantiated vsa [x \mapsto K_j ys]
-  where
-    -- Some more uniqSupplies
-    (us1, us2) = splitUniqSupply us
+covered_list_matcher :: UniqSupply
+                     -> [PatVec]      -- Translated Guards
+                     -> PmPat Pattern -> PatVec -- Current Clause
+                     -> PmPat ValAbs  -> UncoveredVec   -- Uncovered (one vector ONLY)
+                     -> CoveredSet -- Covered
+covered_list_matcher us gvsa (PmVar x) ps va (vva, (tm_cs, ty_cs))                                {- [CVar]    -}
+  | Just new_tm <- tmOracle tm_cs [(x,pmPatToPmExpr va)]
+  = ucon (VA va) $ covered_list us gvsa ps (vva, (new_tm, ty_cs))
+  | otherwise = [] -- Mismatch
 
-    -- Unfold the variable to all possible constructor patterns
-    cons_cs    = zipWith (mkOneConFull x) (listSplitUniqSupply us1) (allConstructors con)
-    add_one (va,cs) valset = valset `mkUnion` (VA va `mkCons` (cs `mkConstraint` vsa))
-    inst_vsa   = foldr add_one Empty cons_cs
+covered_list_matcher us gvsa (p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps              {- [CConCon] -}
+                                (PmCon { pm_con_con = c2, pm_con_args = args2 }) (vva, cs)
+  | c1 /= c2  = [] -- Mismatch
+  | otherwise = kcon c1 (pm_con_arg_tys p)
+                        (pm_con_tvs     p)
+                        (pm_con_dicts   p)
+                        (covered_list us gvsa (args1 ++ ps) (args2 ++ vva, cs))
 
--- | dMatcher
+covered_list_matcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) (vva, (tm_cs, ty_cs))  {- [CConVar] -}
+  | let  (us1, us2)                        = splitUniqSupply us
+  , let  (con_abs, more_tm_cs, more_ty_cs) = mkOneConFull2 x us1 con
+  , Just new_tm <- tmOracle tm_cs more_tm_cs
+  = covered_list_matcher us2 gvsa p ps con_abs (vva, (new_tm, more_ty_cs `unionBags` ty_cs))
+  | otherwise = [] -- Mismatch
+
 -- ----------------------------------------------------------------------------
-dMatcher :: PmMatcher
+-- ----------------------------------------------------------------------------
 
--- DVar
-dMatcher us gvsa (PmVar x) ps va vsa
-  = VA va `mkCons` (cs `mkConstraint` divergent us gvsa ps vsa)
-  where cs = [TmConstraint x (pmPatToPmExpr va)]
+uncovered_list :: UniqSupply
+               -> [PatVec] -- Translated Guards
+               -> PatVec        -- Current Clause
+               -> UncoveredVec  -- Uncovered (one vector ONLY)
+               -> UncoveredSet -- Uncovered
+uncovered_list us gvsa [] vva
+  | null gvsa = [] -- No Guards (no missing then)
+  | otherwise = uncovered_guards us gvsa [vva]
 
--- DConCon
-dMatcher us gvsa (p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
-                    (PmCon { pm_con_con = c2, pm_con_args = args2 }) vsa
-  | c1 /= c2  = Empty
-  | otherwise = wrapK c1 (pm_con_arg_tys p)
-                         (pm_con_tvs     p)
-                         (pm_con_dicts   p)
-                         (divergent us gvsa (args1 ++ ps) (foldr mkCons vsa args2))
+uncovered_list us gvsa (p@(PmGuard pv e) : ps) (vva, (tm_cs, ty_cs)) {- [UGuard]  -} -- YOU JUST HAVE TO IMPLEMENT THIS TOO
+  | Just new_tm <- tmOracle tm_cs [(y,e)]
+  = utail $ uncovered_list us2 gvsa (pv++ps) (VA (PmVar y) : vva, (new_tm, ty_cs))
+  | otherwise = [(vva, (tm_cs, ty_cs))] -- Mismatch (Can't happen. Why? Because y is fresh)
+  where (us1, us2) = splitUniqSupply us
+        y  = mkPmId us1 (patternType p)
+uncovered_list us gvsa (NonGuard p   : ps) (VA va : vva, cs) = uncovered_list_matcher us gvsa p ps va (vva, cs)
+uncovered_list us gvsa (NonGuard _   : _)  ([],           _) = panic "uncovered_list: length mismatch (left)"
+uncovered_list us gvsa []                  (_:_,          _) = panic "uncovered_list: length mismatch (right)"
 
--- DConVar
-dMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa
-  = mkUnion (VA (PmVar x) `mkCons` mkConstraint [BtConstraint x] vsa)
-            (dMatcher us2 gvsa p ps con_abs (mkConstraint all_cs vsa))
+uncovered_list_matcher :: UniqSupply
+                       -> [PatVec]      -- Translated Guards
+                       -> PmPat Pattern -> PatVec -- Current Clause
+                       -> PmPat ValAbs  -> UncoveredVec   -- Uncovered (one vector ONLY)
+                       -> UncoveredSet -- Uncovered
+uncovered_list_matcher us gvsa (PmVar x) ps va (vva, (tm_cs, ty_cs))                                {- [UVar]    -}
+  | Just new_tm <- tmOracle tm_cs [(x,pmPatToPmExpr va)]
+  = ucon (VA va) $ uncovered_list us gvsa ps (vva, (new_tm, ty_cs))
+  | otherwise = [(VA va : vva, (tm_cs, ty_cs))] -- Mismatch
+
+uncovered_list_matcher us gvsa p@(PmCon { pm_con_con = c1, pm_con_args = args1 }) ps              {- [UConCon] -}
+                              va@(PmCon { pm_con_con = c2, pm_con_args = args2 }) (vva, cs)
+  | c1 /= c2  = [(VA va : vva, cs)] -- Mismatch
+  | otherwise = kcon c1 (pm_con_arg_tys p)
+                        (pm_con_tvs     p)
+                        (pm_con_dicts   p)
+                        (uncovered_list us gvsa (args1 ++ ps) (args2 ++ vva, cs))
+
+uncovered_list_matcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) (vva, (tm_cs, ty_cs))  {- [CConVar] -}
+  | let (us1, us2) = splitUniqSupply us
+  , let cons_cs = zipWith (mkOneConFull2 x) (listSplitUniqSupply us1) (allConstructors con) --  (con_abs, more_tm_cs, more_ty_cs)
+  = concat (zipWith uncovered_list_matcher_many (listSplitUniqSupply us2) cons_cs)
   where
-    (us1, us2)        = splitUniqSupply us
-    (con_abs, all_cs) = mkOneConFull x us1 con
+    uncovered_list_matcher_many u (con_abs, more_tm_cs, more_ty_cs)
+      | Just new_tm <- tmOracle tm_cs more_tm_cs
+      = uncovered_list_matcher u gvsa p ps con_abs (vva, (new_tm, more_ty_cs `unionBags` ty_cs))
+      | otherwise = [] -- Prune it now
+
+
+-- ----------------------------------------------------------------------------
+-- ----------------------------------------------------------------------------
+
+-- Just copied the covered version. Now you have to fix it
+divergent_list :: UniqSupply
+               -> [PatVec] -- Translated Guards
+               -> PatVec        -- Current Clause
+               -> UncoveredVec  -- Uncovered (one vector ONLY)
+               -> DivergentSet    -- Covered
+divergent_list us gvsa [] vva
+  | null gvsa = []   -- No Guards ==> Nothing forced here
+  | otherwise = divergent_guards us gvsa [vva]
+
+divergent_list us gvsa (p@(PmGuard pv e) : ps) (vva, (tm_cs, ty_cs)) {- [CGuard]  -} -- YOU JUST HAVE TO IMPLEMENT THIS TOO
+  | Just new_tm <- tmOracle tm_cs [(y,e)]
+  = utail $ divergent_list us2 gvsa (pv++ps) (VA (PmVar y) : vva, (new_tm, ty_cs))
+  | otherwise = [] -- Mismatch (Can't happen. Why? Because y is fresh)
+  where (us1, us2) = splitUniqSupply us
+        y  = mkPmId us1 (patternType p)
+divergent_list us gvsa (NonGuard p   : ps) (VA va : vva, cs) = divergent_list_matcher us gvsa p ps va (vva, cs)
+divergent_list us gvsa (NonGuard _   : _)  ([],           _) = panic "divergent_list: length mismatch (left)"
+divergent_list us gvsa []                  (_:_,          _) = panic "divergent_list: length mismatch (right)"
+
+divergent_list_matcher :: UniqSupply
+                       -> [PatVec]      -- Translated Guards
+                       -> PmPat Pattern -> PatVec -- Current Clause
+                       -> PmPat ValAbs  -> UncoveredVec   -- Uncovered (one vector ONLY)
+                       -> DivergentSet -- Covered
+divergent_list_matcher us gvsa (PmVar x) ps va (vva, (tm_cs, ty_cs))                                {- [CVar]    -}
+  | Just new_tm <- tmOracle tm_cs [(x,pmPatToPmExpr va)]
+  = ucon (VA va) $ divergent_list us gvsa ps (vva, (new_tm, ty_cs))
+  | otherwise = [] -- Mismatch
+
+divergent_list_matcher us gvsa (p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps              {- [CConCon] -}
+                                  (PmCon { pm_con_con = c2, pm_con_args = args2 }) (vva, cs)
+  | c1 /= c2  = [] -- Mismatch
+  | otherwise = kcon c1 (pm_con_arg_tys p)
+                        (pm_con_tvs     p)
+                        (pm_con_dicts   p)
+                        (divergent_list us gvsa (args1 ++ ps) (args2 ++ vva, cs))
+
+divergent_list_matcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) (vva, (tm_cs, ty_cs))  {- [CConVar] -}
+  | canDiverge x tm_cs = (VA (PmVar x) : vva, (tm_cs, ty_cs)) : rest
+  | otherwise          =                                        rest
+  where
+    rest | let  (us1, us2)                        = splitUniqSupply us
+         , let  (con_abs, more_tm_cs, more_ty_cs) = mkOneConFull2 x us1 con
+         , Just new_tm <- tmOracle tm_cs more_tm_cs
+         = divergent_list_matcher us2 gvsa p ps con_abs (vva, (new_tm, more_ty_cs `unionBags` ty_cs))
+         | otherwise = [] -- Mismatch
+
+-- ----------------------------------------------------------------------------
+-- | Covered, Uncovered, Eliminated: versions that perform on whole sets
+--     TIP: Write a function that does this and instantiate 3 times.
+--          The structure is the same and we hate repetition, right?
+-- ----------------------------------------------------------------------------
+
+-- Big Version
+covered :: UniqSupply -> [PatVec] -> PatVec -> UncoveredSet -> CoveredSet
+covered us gvsa vec vsa = concatMap (\(u, uvec) -> covered_list u gvsa vec uvec) uvecs
+  where uvecs = listSplitUniqSupply us `zip` vsa
+
+-- Big Version
+uncovered :: UniqSupply -> [PatVec] -> PatVec -> UncoveredSet -> UncoveredSet
+uncovered us gvsa vec vsa = concatMap (\(u, uvec) -> uncovered_list u gvsa vec uvec) uvecs
+  where uvecs = listSplitUniqSupply us `zip` vsa
+
+-- Big Version
+divergent :: UniqSupply -> [PatVec] -> PatVec -> UncoveredSet -> DivergentSet
+divergent us gvsa vec vsa = concatMap (\(u, uvec) -> divergent_list u gvsa vec uvec) uvecs
+  where uvecs = listSplitUniqSupply us `zip` vsa
+
+-- ----------------------------------------------------------------------------
+-- ----------------------------------------------------------------------------
+
+-- || pmTraverse :: UniqSupply
+-- ||            -> ValSetAbs -- gvsa
+-- ||            -> PmMatcher -- what to do
+-- ||            -> PatVec
+-- ||            -> ValSetAbs
+-- ||            -> ValSetAbs
+-- || pmTraverse _us _gvsa _rec _vec Empty      = Empty
+-- || pmTraverse _us  gvsa _rec []   Singleton  = gvsa
+-- || pmTraverse _us _gvsa _rec []   (Cons _ _) = panic "pmTraverse: cons"
+-- || pmTraverse  us  gvsa  rec vec  (Union vsa1 vsa2)
+-- ||   = mkUnion (pmTraverse us1 gvsa rec vec vsa1)
+-- ||             (pmTraverse us2 gvsa rec vec vsa2)
+-- ||   where (us1, us2) = splitUniqSupply us
+-- || pmTraverse us gvsa rec vec (Constraint cs vsa)
+-- ||   = mkConstraint cs (pmTraverse us gvsa rec vec vsa)
+-- || pmTraverse us gvsa rec (p:ps) vsa =
+-- ||   case p of
+-- ||     -- Guard Case
+-- ||     PmGuard pv e ->
+-- ||       let (us1, us2) = splitUniqSupply us
+-- ||           y  = mkPmId us1 (patternType p)
+-- ||           cs = [TmConstraint y e]
+-- ||       in  mkConstraint cs $ tailValSetAbs $
+-- ||             pmTraverse us2 gvsa rec (pv++ps) (VA (PmVar y) `mkCons` vsa)
+-- || 
+-- ||     -- Constructor/Variable/Literal Case
+-- ||     NonGuard pat
+-- ||       | Cons (VA va) vsa <- vsa -> rec us gvsa pat ps va vsa
+-- ||       | otherwise               -> panic "pmTraverse: singleton" -- can't be anything else
+
+-- || type PmMatcher =  UniqSupply
+-- ||                -> ValSetAbs
+-- ||                -> PmPat Pattern -> PatVec -- pattern vector head and tail
+-- ||                -> PmPat ValAbs  -> ValSetAbs -- value set abstraction head and tail
+-- ||                -> ValSetAbs
+
+-- || -- | cMatcher
+-- || -- ----------------------------------------------------------------------------
+-- || cMatcher :: PmMatcher
+-- || 
+-- || -- CVar
+-- || cMatcher us gvsa (PmVar x) ps va vsa
+-- ||   = VA va `mkCons` (cs `mkConstraint` covered us gvsa ps vsa)
+-- ||   where cs = [TmConstraint x (pmPatToPmExpr va)]
+-- || 
+-- || -- CConCon
+-- || cMatcher us gvsa (p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
+-- ||                     (PmCon { pm_con_con = c2, pm_con_args = args2 }) vsa
+-- ||   | c1 /= c2  = Empty
+-- ||   | otherwise = wrapK c1 (pm_con_arg_tys p)
+-- ||                          (pm_con_tvs     p)
+-- ||                          (pm_con_dicts   p)
+-- ||                          (covered us gvsa (args1 ++ ps) (foldr mkCons vsa args2))
+-- || 
+-- || -- CConVar
+-- || cMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa
+-- ||   = cMatcher us2 gvsa p ps con_abs (mkConstraint all_cs vsa)
+-- ||   where
+-- ||     (us1, us2)        = splitUniqSupply us
+-- ||     (con_abs, all_cs) = mkOneConFull x us1 con
+
+-- || -- | uMatcher
+-- || -- ----------------------------------------------------------------------------
+-- || uMatcher :: PmMatcher
+-- || 
+-- || -- UVar
+-- || uMatcher us gvsa (PmVar x) ps va vsa
+-- ||   = VA va `mkCons` (cs `mkConstraint` uncovered us gvsa ps vsa)
+-- ||   where cs = [TmConstraint x (pmPatToPmExpr va)]
+-- || 
+-- || -- UConCon
+-- || uMatcher us gvsa ( p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
+-- ||                  (va@(PmCon { pm_con_con = c2, pm_con_args = args2 })) vsa
+-- ||   | c1 /= c2  = VA va `mkCons` vsa
+-- ||   | otherwise = wrapK c1 (pm_con_arg_tys p)
+-- ||                          (pm_con_tvs     p)
+-- ||                          (pm_con_dicts   p)
+-- ||                          (uncovered us gvsa (args1 ++ ps) (foldr mkCons vsa args2))
+-- || 
+-- || -- UConVar
+-- || uMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa
+-- ||   = uncovered us2 gvsa (NonGuard p : ps) inst_vsa -- instantiated vsa [x \mapsto K_j ys]
+-- ||   where
+-- ||     -- Some more uniqSupplies
+-- ||     (us1, us2) = splitUniqSupply us
+-- || 
+-- ||     -- Unfold the variable to all possible constructor patterns
+-- ||     cons_cs    = zipWith (mkOneConFull x) (listSplitUniqSupply us1) (allConstructors con)
+-- ||     add_one (va,cs) valset = valset `mkUnion` (VA va `mkCons` (cs `mkConstraint` vsa))
+-- ||     inst_vsa   = foldr add_one Empty cons_cs
+
+-- || -- | dMatcher
+-- || -- ----------------------------------------------------------------------------
+-- || dMatcher :: PmMatcher
+-- || 
+-- || -- DVar
+-- || dMatcher us gvsa (PmVar x) ps va vsa
+-- ||   = VA va `mkCons` (cs `mkConstraint` divergent us gvsa ps vsa)
+-- ||   where cs = [TmConstraint x (pmPatToPmExpr va)]
+-- || 
+-- || -- DConCon
+-- || dMatcher us gvsa (p@(PmCon { pm_con_con = c1, pm_con_args = args1 })) ps
+-- ||                     (PmCon { pm_con_con = c2, pm_con_args = args2 }) vsa
+-- ||   | c1 /= c2  = Empty
+-- ||   | otherwise = wrapK c1 (pm_con_arg_tys p)
+-- ||                          (pm_con_tvs     p)
+-- ||                          (pm_con_dicts   p)
+-- ||                          (divergent us gvsa (args1 ++ ps) (foldr mkCons vsa args2))
+-- || 
+-- || -- DConVar
+-- || dMatcher us gvsa (p@(PmCon { pm_con_con = con })) ps (PmVar x) vsa
+-- ||   = mkUnion (VA (PmVar x) `mkCons` mkConstraint [BtConstraint x] vsa)
+-- ||             (dMatcher us2 gvsa p ps con_abs (mkConstraint all_cs vsa))
+-- ||   where
+-- ||     (us1, us2)        = splitUniqSupply us
+-- ||     (con_abs, all_cs) = mkOneConFull x us1 con
 
 {-
 %************************************************************************

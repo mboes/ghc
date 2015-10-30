@@ -10,7 +10,7 @@ module TmOracle (
 
         -- re-exported from PmExpr
         PmExpr(..), PmLit(..), SimpleEq, ComplexEq, PmVarEnv, falsePmExpr,
-        notForced, eqPmLit, filterComplex, isNotPmExprOther, runPmPprM,
+        canDiverge, eqPmLit, filterComplex, isNotPmExprOther, runPmPprM,
         pprPmExprWithParens, lhsExprToPmExpr, hsExprToPmExpr,
 
         -- the term oracle
@@ -57,10 +57,13 @@ type TmOracleEnv = (Bool, PmVarEnv)
 
 
 -- | Check whether a variable has been refined to (at least) a WHNF
-notForced :: Id -> PmVarEnv -> Bool
-notForced x env = case varDeepLookup env x of
-  PmExprVar _ -> True
-  _other_expr -> False
+canDiverge :: Id -> TmState -> Bool
+canDiverge x (_stb, (unhandled, env))
+  = case varDeepLookup env x of
+      PmExprVar _ | True {- ADD THE CONDITION HERE -} -> True
+      _other_expr -> unhandled
+      -- There is one more possible scenario:
+      --   False == (x == '4') -- this implies that x is forced
 
 -- | Flatten the DAG. (Could be improved in terms of performance)
 flattenPmVarEnv :: PmVarEnv -> PmVarEnv
